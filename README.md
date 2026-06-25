@@ -39,6 +39,8 @@ Acta2-LAD-remodeling/
     ├── tgf_Rep3_KWA-62284_S41_L001_bowtie2.mapped.bw
     ├── R179C_vs_WT_Final_Log2Ratio.bw
     └── WT_vs_R179C_Final_Log2Ratio.bw
+```
+
 ## 🛠️ Granular Pipeline Architectures & Code Implementation Details (bulkRNA.Rmd)
 
 ## 📊 Module A: Transcriptomic Cross-Validation & Pruning
