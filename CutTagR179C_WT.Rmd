@@ -1,0 +1,1309 @@
+---
+title: "CutTagv4R179CvsWT"
+author: "Yu Kuan Pan"
+date: "2026-03-19"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ROCR)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(viridis)
+library(GenomicRanges)
+library(chromVAR) ## For FRiP analysis and differential analysis
+library(DESeq2) ## for differential analysis section
+library(ggpubr) ## for customizing figures
+library(corrplot) ## for correlation plot
+source("./cutTagFunction.R")
+library(DT) ## for interactive tables in RMarkdown
+
+
+```
+
+if the graph below doesn't show as expect 
+adjust the order here in sampleList 
+@param sampleListW: List read all 3 alignment names 
+        (   wild type 1% replicate 1: KWA-62277_S34_L001,
+            tgf replicate 1: KWA-62278_s35_L001, 
+            R179C replicate 1: KWA-62279_S36_L001)
+@param histListW: name listed for gene
+```{r}
+sampleListW <- c("wildType_Rep1", "wildType_Rep2", "wildType_Rep3",
+                 "tgf_Rep1", "tgf_Rep2", "tgf_Rep3",
+                 "R179C_Rep1", "R179C_Rep2", "R179C_Rep3")
+histListW <- c("wildType", "tgf", "R179C")
+```
+
+```{r}
+alignResultsW <- c()
+files = list.files(path = "../alignment/samU/bowtie2_summary/", pattern = "_bowtie2.txt") # adjusted based on the file destination 
+
+files
+
+```
+
+### Sequencing depth 
+```{r}
+# Initialize an empty data frame before the loop
+alignResults <- data.frame(Histone = character(),
+                           Replicate = character(),
+                           SequencingDepth = numeric(),
+                           MappedFragNum_mm10 = numeric(),
+                           AlignmentRate_mm10 = numeric(),
+                           stringsAsFactors = FALSE)
+
+# Loop through histone files
+for(hist in files) {
+  
+  # adjusted based on the file destination
+  alignRes <- read.table(paste0("../alignment/samU/bowtie2_summary/", hist), header = FALSE, fill = TRUE, stringsAsFactors = FALSE) 
+  
+  # Extract alignment rate and remove the '%' symbol
+  alignRate <- as.numeric(substr(alignRes$V1[6], 1, nchar(as.character(alignRes$V1[6])) - 1))
+  
+  # Ensure the numeric conversion does not fail
+  mappedFragNum <- sum(as.numeric(alignRes$V1[4]), as.numeric(alignRes$V1[5]), na.rm = TRUE)
+  
+  # Extract histone and replicate information from filename
+  histInfo <- unlist(strsplit(hist, "_"))
+  
+  # Append results
+  alignResults <- rbind(alignResults, data.frame(
+    Histone = histInfo[1],
+    Replicate = histInfo[2],
+    SequencingDepth = as.numeric(as.character(alignRes$V1[1])),
+    MappedFragNum_mm10 = mappedFragNum,
+    AlignmentRate_mm10 = alignRate
+  ))
+}
+
+alignResults %>% mutate(AlignmentRate_mm10 = paste0(AlignmentRate_mm10, "%"))
+
+# Display the result
+
+```
+
+reorder the setting for visualization 
+```{r}
+# Define the desired order for the Histone column
+desired_order <- c("wildType", "tgf", "R179C")
+
+# Convert Histone to a factor with the specified order
+alignResults$Histone <- factor(alignResults$Histone, levels = desired_order)
+
+# Reorder the dataframe based on the factor levels
+alignResults <- alignResults[order(alignResults$Histone), ]
+
+# Display the result
+print(alignResults)
+
+```
+
+Since we only need R179C vs WT for the poster, we can subset the data for better visualization
+```{r}
+alignResults <- subset(alignResults, Histone %in% c("wildType", "R179C"))
+```
+
+### Visualization for poster: Alignment Data 
+```{r}
+# install.packages("DT", type = "source")
+library(DT)
+
+# Create a polished table
+datatable(alignResults, 
+          rownames = FALSE,
+          colnames = c("Condition", "Rep", "Seq Depth", "Mapped Frags", "Alignment %"),
+          options = list(
+              dom = 't',               # Table only (no search box)
+              pageLength = 9,          # Show all rows
+              columnDefs = list(list(className = 'dt-center', targets = "_all"))
+          )) %>%
+    # Add commas to big numbers
+    formatCurrency(c('SequencingDepth', 'MappedFragNum_mm10'), currency = "", interval = 3, mark = ",", digits = 0) %>%
+    # Add a heatmap effect to Alignment Rate to show quality
+    formatStyle(
+        'AlignmentRate_mm10',
+        backgroundColor = styleInterval(c(75, 80), c('#DEEBF7', '#9ECAE1', '#4292C6')),
+        fontWeight = 'bold'
+)
+```
+
+
+##Visualizing the sequening depth and alignment results 
+
+```{r}
+fig3A = alignResults %>% ggplot(aes(x= Histone, y = SequencingDepth/1000000, fill = Histone))+geom_boxplot()+geom_jitter(aes(color= Replicate), position= position_jitter(0.15))+scale_fill_viridis(discrete = TRUE, begin = 0.1, end = 0.9, option = "magma", alpha = 0.8)+scale_color_viridis(discrete = T, begin = 0.1, end = 0.9)+theme_bw(base_size = 10)+ylab("Sequencing Depth per Million")+xlab("")+ggtitle("A. Sequencing Depth")
+
+fig3B = alignResults %>% ggplot(aes(x= Histone, y= MappedFragNum_mm10/1000000, fill = Histone))+geom_boxplot()+geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) + scale_fill_viridis(discrete = T, begin = 0.1, end = 0.9, option = "magma", alpha = 0.8) + scale_color_viridis(discrete = T, begin = 0.1, end = 0.9)+theme_bw(base_size = 10)+ylab("Mapped Fragments per Million")+xlab("")+ggtitle("B. Alignable Fragment (mm10)")
+
+fig3C = alignResults %>% ggplot(aes(x = Histone, y = AlignmentRate_mm10, fill = Histone)) +
+    geom_boxplot() +
+    geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+    scale_fill_viridis(discrete = TRUE, begin = 0.1, end = 0.9, option = "magma", alpha = 0.8) +
+    scale_color_viridis(discrete = TRUE, begin = 0.1, end = 0.9) +
+    theme_bw(base_size = 10) +
+    ylab("% of Mapped Fragments") +
+    xlab("") +
+    ggtitle("C. Alignment Rate (mm10)")
+
+
+
+ggarrange(fig3A, fig3B, fig3C, ncol = 2, nrow = 2, common.legend = T, legend = "bottom")
+
+```
+
+### Remove Duplicate 
+```{r}
+DupResults <- c()
+files = list.files(path = "../alignment/removeDuplicateU/picard_summary/", pattern = "_picard.rmDup.txt")
+
+files
+
+```
+add the duplication rate and estimated library size to the alignment summary table for better visualization 
+```{r}
+histList<- c("wildType", "tgf", "R179C")
+# Initialize an empty data frame before the loop
+DupResults <- data.frame(Histone = character(),
+                         Replicate = character(),
+                         #SequencingDepth = numeric(),
+                         MappedFragNum_mm10 = numeric(),
+                         DuplicationRateRate_mm10 = numeric(),
+                         EstimatedLibrarySize= numeric(),
+                         stringsAsFactors = FALSE)
+
+# Loop through histone files
+for(hist in files) {
+  
+  dupRes <- read.table(paste0("../alignment/removeDuplicateU/picard_summary/", hist), header = TRUE, fill = TRUE, stringsAsFactors = FALSE)
+  
+  histInfo<- strsplit(hist, "_")[[1]]
+  DupResults<- data.frame(Histone = histInfo[1], Replicate=  histInfo[2],
+                          MappedFragNum_mm10 = dupRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric, 
+                          DuplicationRate_mm10 = dupRes$PERCENT_DUPLICATION[1] %>% as.character %>% as.numeric*100, 
+                          EstimatedLibrarySize = dupRes$ESTIMATED_LIBRARY_SIZE[1] %>% as.character %>% as.numeric) %>% 
+    mutate(UniqueFragNum = MappedFragNum_mm10 * (1-DuplicationRate_mm10/100)) %>% rbind(DupResults, .)
+}
+
+DupResults$Histone = factor(DupResults$Histone, levels = histList)
+alignDupSummary = left_join(alignResults, DupResults, by = c("Histone", "Replicate", "MappedFragNum_mm10")) %>% 
+  mutate(DuplicationRate_mm10 = paste0(DuplicationRate_mm10, "%"))
+
+DupResults
+DupResults<- subset(DupResults, Histone %in% c("wildType", "R179C")) # since we only need the information of R179C vs WT for the poster, we can subset the data for better visualization
+alignDupSummary
+
+
+# Display the result
+
+```
+
+```{r}
+# 1. Pre-process: Handle the specific column name 'DuplicationRateRate_mm10'
+# We create hidden numeric columns (Dup_Num, Align_Num) to drive the colors
+plot_data <- alignDupSummary %>%
+  mutate(
+    # Use the exact name from your dataframe to avoid 'object not found' error
+    Dup_Num = as.numeric(gsub("%", "", DuplicationRate_mm10)),
+    Align_Num = as.numeric(AlignmentRate_mm10)
+  )
+
+# 2. Create the polished interactive table for the poster
+datatable(plot_data, 
+          rownames = FALSE,
+          # Rename columns for the final display to look professional
+          colnames = c("Condition", "Replicate", "Seq Depth", "Mapped Frags", 
+                       "Alignment %", "Duplication %", "Est. Lib Size", "Unique Frags", 
+                       "Dup_Hidden", "Align_Hidden"),
+          options = list(
+              dom = 't',                         # Table only (cleaner for posters)
+              pageLength = 6,                    # Display all rows
+              columnDefs = list(
+                  list(visible = FALSE, targets = c(8, 9)), # Hide helper numeric columns
+                  list(className = 'dt-center', targets = "_all")
+              )
+          )) %>%
+    # Format integers with commas for high-quality scientific reporting
+    formatCurrency(c('SequencingDepth', 'MappedFragNum_mm10', 'EstimatedLibrarySize', 'UniqueFragNum'), 
+                   currency = "", interval = 3, mark = ",", digits = 0) %>%
+    # Apply Blue Heatmap to Alignment Rate
+    formatStyle(
+        'AlignmentRate_mm10',
+        'Align_Num', 
+        backgroundColor = styleInterval(c(70, 75), c('#DEEBF7', '#9ECAE1', '#4292C6')),
+        fontWeight = 'bold'
+    ) %>%
+    # Apply Green Heatmap to Duplication Rate
+    formatStyle(
+        'DuplicationRate_mm10',
+        'Dup_Num',
+        backgroundColor = styleInterval(c(50, 65), c('#F7FCF0', '#E0F3DB', '#A8DDB5'))
+    )
+```
+
+### remove duplicated plot 
+```{r ,fig.width = 30, fig.height = 8}
+fig4A = DupResults %>% ggplot(aes(x= Histone, y= DuplicationRate_mm10, fill= Histone)) +
+  geom_boxplot()+ 
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15))+
+  scale_fill_viridis(discrete = TRUE, begin = 0.1, end = 0.9, option = "magma", alpha = 0.8)+
+  scale_color_viridis(discrete = TRUE, begin = 0.1, end = 0.9)+
+  theme_bw(base_size = 14)+
+  ylab("Duplication Rate (*100%)")+
+  xlab("")
+
+fig4B = DupResults %>% ggplot(aes(x= Histone, y = EstimatedLibrarySize, fill= Histone)) + 
+  geom_boxplot()+
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15))+
+  scale_fill_viridis(discrete = TRUE, begin = 0.1, end = 0.9, option = "magma", alpha = 0.8)+
+  scale_color_viridis(discrete = TRUE, begin = 0.1, end = 0.9)+
+  theme_bw(base_size = 14)+
+  ylab("Estimated Library Size")+
+  xlab("")
+
+fig4C = DupResults %>% ggplot(aes(x= Histone, y= UniqueFragNum, fill = Histone))+
+  geom_boxplot()+
+  geom_jitter(aes(color= Replicate), position = position_jitter(0.15))+
+  scale_fill_viridis(discrete = TRUE, begin = 0.1, end = 0.9, option = "magma", alpha = 0.8)+
+  scale_color_viridis(discrete = TRUE, begin = 0.1, end = 0.9)+
+  theme_bw(base_size = 14)+
+  ylab("# of Unique Fragments")+
+  xlab("")
+
+ggarrange(fig4A, fig4B, fig4C, ncol = 3, common.legend = T, legend = "bottom")
+```
+
+#### fraglen info
+```{r}
+FragResults <- c()
+files = list.files(path = "../alignment/samU/fragmentLen/", pattern = "_fragmentLen.txt")
+
+files
+
+```
+
+```{r}
+fragLen <- NULL
+for(hist in files){
+  histInfo<- strsplit(hist, "_")[[1]]
+  temp<- read.table(paste0("../alignment/samU/fragmentLen/", hist), header = F) %>% 
+    mutate(fragLen = V1 %>% as.numeric, 
+           fragCount = V2 %>% as.numeric, 
+           Weight= as.numeric(V2)/sum(as.numeric(V2)),
+           Histone = histInfo[1], 
+           Replicate = histInfo[2], 
+           sampleIfo = 
+             paste0(histInfo[1], "_", histInfo[2])) 
+    fragLen <- bind_rows(fragLen, temp)
+}
+
+fragLen<- subset(fragLen, Histone %in% c("wildType", "R179C")) # since we only need the information of R179C vs WT for the poster, we can subset the data for better visualization
+```
+
+```{r, fig.width = 12, fig.height = 4}
+fragLen <- NULL
+
+for (hist in files) {
+  histInfo <- strsplit(hist, "_")[[1]]
+  histoneName <- histInfo[1]  
+  replicateName <- histInfo[2] 
+  
+  temp <- read.table(paste0("../alignment/samU/fragmentLen/", hist), header = FALSE) %>%
+    mutate(
+      fragLen = as.numeric(V1),
+      fragCount = as.numeric(V2),
+      Weight = fragCount / sum(fragCount),
+      Histone = histoneName,
+      Replicate = replicateName,
+      sampleInfo = paste0(histInfo[1], "_", histInfo[2])
+    )
+  temp<- subset(temp, Histone %in% c("wildType", "R179C")) # since we only need the information of R179C vs WT for the poster, we can subset the data for better visualization
+  fragLen <- bind_rows(fragLen, temp)
+}
+
+# Convert to factors
+fragLen$sampleInfo <- factor(fragLen$sampleInfo, levels = sampleListW)
+fragLen$Histone <- factor(fragLen$Histone, levels = c("wildType", "R179C"))  
+
+fig5A <- fragLen %>%
+  ggplot(aes(
+    x = sampleInfo,
+    y = fragLen,
+    weight = Weight,
+    fill = Histone
+  )) +
+  geom_violin(bw = 5) +
+  scale_y_continuous(breaks = seq(0, 800, 50)) +
+  scale_fill_viridis(
+    discrete = TRUE,
+    begin = 0.1, end = 0.9,
+    option = "magma", alpha = 0.8
+  ) +
+  theme_bw(base_size = 12) +
+  ggpubr::rotate_x_text(angle = 20) +
+  ylab("Fragment Length") +
+  xlab("")+ theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank()
+  )
+
+
+# Line plot of fragment length distributions by sample
+fig5B <- fragLen %>%
+  filter(!is.na(fragLen), !is.na(fragCount)) %>%
+  ggplot(aes(
+    x = fragLen,
+    y = fragCount,
+    color = Histone,
+    group = sampleInfo,
+    linetype = Replicate
+  )) +
+  geom_line(linewidth = 1) +
+  scale_color_viridis(
+    discrete = TRUE,
+    begin = 0.1, end = 0.9,
+    option = "magma"
+  ) +
+  theme_bw(base_size = 12) +
+  xlab("Fragment Length") +
+  ylab("Count") +
+  coord_cartesian(xlim = c(0, 500))
+
+# Combine the two plots side by side
+ggarrange(fig5A, fig5B, nrow = 2)
+```
+
+```{r}
+# 1. Rename the 'Histone' levels in your data
+fragLen <- fragLen %>%
+  mutate(Histone = recode(Histone, "wildType" = "WT"))
+
+# 2. Update Figure 5A
+fig5A <- fragLen %>%
+  ggplot(aes(
+    x = sampleInfo,
+    y = fragLen,
+    weight = Weight,
+    fill = Histone # This will now show "WT" in the legend
+  )) +
+  geom_violin(bw = 5) +
+  scale_y_continuous(breaks = seq(0, 800, 50)) +
+  scale_fill_viridis(
+    discrete = TRUE,
+    begin = 0.1, end = 0.9,
+    option = "magma", alpha = 0.8
+  ) +
+  theme_bw(base_size = 12) +
+  ylab("Fragment Length") +
+  xlab("") + 
+  # Keeps the bottom axis clean as requested before
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.title = element_blank() # Optional: removes "Histone" title for a cleaner legend
+  )
+
+# Line plot of fragment length distributions by sample
+fig5B <- fragLen %>%
+  filter(!is.na(fragLen), !is.na(fragCount)) %>%
+  ggplot(aes(
+    x = fragLen,
+    y = fragCount,
+    color = Histone,
+    group = sampleInfo,
+    linetype = Replicate
+  )) +
+  geom_line(linewidth = 1) +
+  scale_color_viridis(
+    discrete = TRUE,
+    begin = 0.1, end = 0.9,
+    option = "magma"
+  ) +
+  theme_bw(base_size = 12) +
+  xlab("Fragment Length") +
+  ylab("Count") +
+  coord_cartesian(xlim = c(0, 500))
+
+# Combine the two plots side by side
+ggarrange(fig5A, fig5B, nrow = 2)
+```
+
+
+# Update part 
+the update part start from here with the new bam file and bed
+## Assess Replicate reproducibility
+```{r}
+FragResults <- c()
+files = list.files(path = "../alignment/bedWOEcoli/", pattern = "_bowtie2.fragmentsCount.bin500.bed")
+
+files
+```
+```{r}
+library(dplyr)
+library(corrplot)
+
+# Your file list (already loaded)
+# Make sure the `files` vector is defined
+
+# Initialize
+fragCount <- NULL
+ 
+for (file in files) {
+  
+  # Extract sample name (e.g., "R179C_Rep1") from the filename
+  sample_name <- strsplit(file, "_KWA")[[1]][1]
+  
+  # Read fragment count file (3-column BED-like: chrom, bin, count)
+  frag_tmp <- read.table(paste0("../alignment/bedWOEcoli/", file), header = FALSE)
+  colnames(frag_tmp) <- c("chrom", "bin", sample_name)
+  
+  # Merge
+  if (is.null(fragCount)) {
+    fragCount <- frag_tmp
+  } else {
+    fragCount <- full_join(fragCount, frag_tmp, by = c("chrom", "bin"))
+  }
+}
+
+
+# Define proper sample order by group
+sample_order <- c(
+  "R179C_Rep1", "R179C_Rep2", "R179C_Rep3",
+  "wildType_Rep1", "wildType_Rep2", "wildType_Rep3"
+)
+
+# Check if all sample names were correctly extracted
+if (!all(sample_order %in% colnames(fragCount))) {
+  stop("Some expected sample names are missing. Please double-check filename parsing.")
+}
+
+# Select and reorder samples, log2 transform
+frag_mat <- fragCount %>%
+  select(all_of(sample_order)) %>%
+  log2()
+
+# Compute correlation matrix
+cor_mat <- cor(frag_mat, use = "complete.obs")
+
+```
+
+```{r, fig.with = 10, fig.height = 12}
+# Plot
+corrplot(cor_mat[sample_order, sample_order],
+         method = "color",
+         outline = TRUE,
+         addgrid.col = "darkgray",
+         order = "original",   # critical to preserve your group ordering
+         addrect = 3,
+         rect.col = "black", rect.lwd = 3,
+         cl.pos = "b", tl.col = "indianred4", tl.cex = 1,
+         cl.cex = 1, addCoef.col = "black", 
+         number.digits = 2, number.cex = 1,
+         col = colorRampPalette(c("midnightblue", "white", "darkred"))(100))
+```
+
+```{r}
+frag_mat[is.na(frag_mat)] <- 0
+frag_mat_filtered <- frag_mat[apply(frag_mat, 1, function(x) var(x) > 0), ]
+
+```
+
+```{r}
+# After computing PCA as before
+pca <- prcomp(t(log2(frag_mat_filtered + 1)), scale. = TRUE)
+
+# Assign group colors
+group_colors <- rep(c("red", "green"), each = 3)
+
+# Define sample names (same order as in frag_mat)
+sample_labels <- colnames(frag_mat_filtered)
+
+# Plot with labels
+plot(pca$x[,1], pca$x[,2],
+     col = group_colors,
+     pch = 19, xlab = "PC1", ylab = "PC2", main = "PCA of Fragment Counts", ylim = c(-600, 2200))
+
+# Add text labels to each point
+text(pca$x[,1], pca$x[,2],
+     labels = sample_labels,
+     pos = 3, cex = 0.8, col = group_colors)
+
+# Add legend
+legend("topleft",
+       legend = c("R179C", "wildType"),
+       col = c("red", "green"),
+       pch = 19)
+
+```
+
+```{r}
+# Assuming frag_mat is already log2-transformed and ordered
+frag_mat[is.na(frag_mat)] <- 0
+
+# Filter rows with variance > 0 (as in your PCA)
+frag_mat_filtered <- frag_mat[apply(frag_mat, 1, function(x) var(x) > 0), ]
+
+# Transpose to cluster **samples**, not bins
+frag_mat_t <- t(frag_mat_filtered)
+
+# Compute distance matrix
+dist_mat <- dist(frag_mat_t, method = "euclidean")
+
+# Hierarchical clustering
+hc <- hclust(dist_mat, method = "complete")  # or "average", "ward.D2", etc.
+
+# Plot dendrogram
+plot(hc,
+     main = "Hierarchical Clustering of Fragment Counts",
+     xlab = "",
+     sub = "",
+     cex = 0.9,
+     hang = -1)
+
+```
+
+# PeakCalling 
+
+instead of using SEACR or Scaling Factor for normalization we utilized goPeak to call peaks and then use the called peaks to do the downstream analysis.
+
+##  GoPeak Result (slide 50 step 20)
+this study apply two different argument to calculated peaks 
+the first filter is slide 50, which means the window size for calculating the local background is 50bp, and the second filter is step 20, which means the step size for sliding the window is 20bp. The combination of these two parameters allows us to identify peaks with a certain level of resolution and sensitivity, while also controlling for local background noise in our ChIP-seq data.
+```{r}
+histL = c("R179C", "tgfB", "wildType") 
+repL = paste0("Rep", 1:3)
+peakSummary = data.frame()
+
+for(hist in histL){
+  # Temporary list to store GRanges for this condition
+  temp_rep_list <- list()
+  
+  # Step 1: Read all available replicates first
+  for(rep in repL){
+    pattern_string <- paste0(hist, "_", rep, ".*_peaks")
+    
+    target_file <- list.files(
+      path = "../cutTagRes/cutAndTag/goPeakRes_Step50_slide20/",
+      pattern = pattern_string,
+      full.names = TRUE)
+    
+    target_file <- target_file[!grepl("Identifier", target_file)]
+    
+    if(length(target_file) > 0){
+      peakInfo = read.table(target_file[1], header = FALSE)
+      message("Successfully read: ", basename(target_file[1]))
+      
+      peak_gr = GRanges(seqnames = peakInfo$V1,
+                        ranges = IRanges(start = peakInfo$V2, end = peakInfo$V3))
+      
+      # Store the GRanges in our list named by the Replicate
+      temp_rep_list[[rep]] <- peak_gr
+    } else {
+      warning("Could not find file for ", hist, " ", rep)
+    }
+  }
+  
+  # Step 2: Calculate the Common Peak set (Intersection of all found replicates)
+  if(length(temp_rep_list) >= 2){
+    # Start with the first replicate
+    common_gr = temp_rep_list[[1]]
+    
+    # Intersect with every subsequent replicate found
+    for(i in 2:length(temp_rep_list)){
+      hits = findOverlaps(common_gr, temp_rep_list[[i]])
+      common_gr = common_gr[unique(queryHits(hits))]
+    }
+    
+    # This is your final consensus count (e.g., 604)
+    final_consensus_count = length(common_gr)
+    
+    # Step 3: Create rows for the table using the final consensus count
+    for(rep_name in names(temp_rep_list)){
+      temp_row = data.frame(
+        Histone = hist,
+        Replicate = rep_name,
+        peakN = length(temp_rep_list[[rep_name]]), # Total in this file (e.g., 1973)
+        peakReprodNum = final_consensus_count      # Always the common count (e.g., 604)
+      )
+      peakSummary = rbind(peakSummary, temp_row)
+    }
+    
+    # Optional: Save the consensus BED file for your Heatmap
+    # rtracklayer::export(common_gr, paste0(hist, "_consensus_peaks.bed"))
+    
+  } else {
+    message("Not enough replicates to calculate overlap for ", hist)
+  }
+}
+
+# Step 4: Final Calculation
+peakReprod = peakSummary %>% 
+  mutate(peakReprodRate = (peakReprodNum / peakN) * 100)
+
+print(peakReprod)
+```
+
+since the study only focusing on comparing the different between R179C and wildtype, we can subset the data for better visualization
+```{r}
+peakReprodSub<- subset(peakReprod, Histone %in% c("R179C", "wildType"))
+peakReprodSub
+```
+
+```{r}
+library(DT)
+library(dplyr)
+# 1. Pre-process: No string conversion needed since these are already integers/doubles
+# We use peakReprodRate directly for the heatmap effect
+plot_peak_data <- peakReprodSub 
+
+# 2. Create the polished Peak Reproduction table
+datatable(plot_peak_data, 
+          rownames = FALSE,
+          # Rename headers to be professional for the poster
+          colnames = c("Condition", "Replicate", "Total Peaks", "Reproduced Peaks", "Reproduction %"),
+          options = list(
+              dom = 't',                         # Clean layout: table only
+              pageLength = 6,                    # Show all rows
+              columnDefs = list(
+                  list(className = 'dt-center', targets = "_all")
+              )
+          )) %>%
+    # Format peak counts with commas
+    formatCurrency(c('peakN', 'peakReprodNum'), 
+                   currency = "", interval = 3, mark = ",", digits = 0) %>%
+    # Format the Rate to 2 decimal places
+    formatRound('peakReprodRate', 2) %>%
+    # Apply a Green Heatmap to Reproduction Rate (Higher = More Consistent)
+    formatStyle(
+        'peakReprodRate',
+        backgroundColor = styleInterval(c(30, 50), c('#F7FCF0', '#E0F3DB', '#A8DDB5')),
+        fontWeight = 'bold'
+    )
+```
+
+
+## master peak (general 3 replicate sample )
+the purpose is to get the master peak list for the heatmap, which is the union of all peaks across all samples. This will allow us to have a comprehensive set of peaks to analyze and visualize in the heatmap, ensuring that we capture all relevant regions of interest from our ChIP-seq data.
+```{r}
+mPeak = GRanges()
+## overlap with bam file to get count 
+for(hist in histL){
+  for(rep in repL){
+    pattern_string <- paste0(hist, "_", rep, ".*_peaks")
+    
+    target_file <- list.files(
+      path = "../cutTagRes/cutAndTag/goPeakRes_Step50_slide20/",
+      pattern = pattern_string,
+      full.names = TRUE)
+    
+    target_file <- target_file[!grepl("Identifier", target_file)]
+    
+    if(length(target_file) > 0){
+      peakInfo = read.table(target_file[1], header = FALSE)
+      message("Successfully read: ", basename(target_file[1]))
+      
+      mPeak = GRanges(seqnames = peakInfo$V1,
+                        ranges = IRanges(start = peakInfo$V2, end = peakInfo$V3), strand = "*") %>% append (mPeak, .)
+    } else {
+      warning("Could not find file for ", hist, " ", rep)
+    }
+    
+    
+  }
+}
+
+masterPeak = reduce(mPeak)
+```
+
+## Get the fragment counts for each peak in the master peak list 
+
+```{r}
+#library(DESeq2)
+
+# Initialize the matrix
+countMat = matrix(NA, length(masterPeak),
+                  length(histL) * length(repL))
+directory = "../alignment/bamWOEcoli/noEcoli/"
+# Get the fragment counts for each peak in the master peak list.
+i = 1
+for(hist in histL){
+  for(rep in repL){
+    
+    # 1. Create a pattern that looks for BOTH the condition and the replicate
+    # Example: "R179C_Rep1" followed by anything, ending in our BAM suffix
+    file_pattern <- paste0(hist, "_", rep, ".*_bowtie2\\.mapped\\.noEcoli\\.bam$")
+    
+    # 2. Search for the file in your directory
+    target_file <- list.files(path = directory, pattern = file_pattern, full.names = TRUE)
+    
+    # 3. Safety check: Make sure we found exactly one file
+    if(length(target_file) > 0){
+      message("Successfully matched: ", basename(target_file[1]))
+      
+      # Use the matched filename for getCounts
+      fragment_counts <- getCounts(target_file[1], masterPeak, paired = TRUE, by_rg = FALSE, format = "bam")
+      countMat[, i] = counts(fragment_counts)[,1]
+      
+    } else {
+      warning("ERROR: Could not find a file matching pattern: ", file_pattern)
+    }
+    
+    i = i + 1
+  }
+}
+
+colnames(countMat) = paste(rep(histL, each = 3), rep(repL, 3),
+                           sep = "_")
+```
+
+run the code below is any of the code below run into undefine function issue
+
+```{r}
+peak_ids <- paste(seqnames(masterPeak), start(masterPeak), end(masterPeak), sep="_")
+rownames(countMat) <- peak_ids
+```
+
+## Sequencing depth normalization and differential enriched peaks detection 
+
+```{r}
+
+selectR = which(rowSums((countMat> 0)) >= 5) # remove low count genes 
+dataS = countMat[selectR,]
+
+condition <- factor(rep(histL, each = length(repL)))
+
+dds<- DESeqDataSetFromMatrix(countData = dataS,
+                              colData = DataFrame(condition),
+                              design = ~ condition)
+DDS<- DESeq(dds)
+normDDS<- counts(DDS, normalized=TRUE) ## normalization with respect to the sequencing depth 
+colnames(normDDS) = paste0(colnames(normDDS), "_norm")
+res = results(DDS, independentFiltering = FALSE,
+              altHypothesis = "greaterAbs")
+countMatDiff = cbind(dataS, normDDS, res)
+#head(countMatDiff)
+```
+
+## compare differntial enriched peaks between different conditions 
+
+```{r}
+res_R179C<- results(DDS, contrast = c("condition", "R179C", "wildType"), independentFiltering = FALSE, altHypothesis = "greaterAbs")
+```
+
+combining raw count, normalized count and the result of differential enriched peaks detection for each comparison with R179C mutate based
+```{r}
+countMatDiff_R179C = cbind(dataS, normDDS, res_R179C)
+```
+
+take the significant peaks with log2FoldChange > 1 and padj < 0.05 for each comparison 
+```{r}
+sig_R179C <- res_R179C[which(res_R179C$padj < 0.05 & res_R179C$log2FoldChange > 1), ] # only one peaks is found even with arugement padj< 0.05  
+```
+
+```{r}
+coords<- as.data.frame(masterPeak[selectR])
+results_table<- cbind(coords[, c("seqnames", "start",
+                                 "end")],
+                      countMatDiff_R179C)
+repressive_candidate<- results_table[which(results_table$padj < 0.05 & results_table$log2FoldChange > 1), ]
+rownames(repressive_candidate)
+```
+since we only find one peak with standard filtering method 
+the study will focus on the strict unique found in unique peak information 
+
+## Match unique/strick unique peak 
+
+## Peak Filter (R179C)
+R179C unique peak match with the result table, the function will extract the peak information and the count information for the unique peak in R179C condition amount 3 replicate, the unique peak is defined as those peak that select amount one type of replicate only, like 3 replicate
+```{r}
+R179C_unique<- extract_target_peak(res_table = results_table, 
+                             bed_path = "../cutTagRes/cutAndTag/goPeakRes_Step50_slide20/UniqueR179C.bed", 
+                             master_gr = masterPeak, 
+                             select_index = selectR)
+```
+
+R179 Strict Unique peak match with the result table, the function will extract the peak information and the count information for the strict unique peak in R179C condition amount 3 replicate, the strict unique peak is defined as those peak that select amount one type of replicate only, like 3 replicate and also not found in other condition 
+```{r}
+R179C_strict_unique<- extract_target_peak(res_table = results_table, 
+                             bed_path = "../cutTagRes/cutAndTag/goPeakRes_Step50_slide20/only_R179C_strict.bed",
+                             master_gr = masterPeak, 
+                             select_index = selectR)
+```
+
+## inverse Match Execution 
+```{r}
+#BiocManager::install(c("ChIPseeker", 
+#                       "TxDb.Mmusculus.UCSC.mm10.knownGene", 
+#                       "org.Mm.eg.db",
+#                       "clusterProfiler"))
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(org.Mm.eg.db)
+```
+
+R179C unique peak summary and annotation
+```{r}
+R179C_Peak_Summary<- chipSeekFunc(peakInfo = R179C_unique)
+dim(R179C_Peak_Summary)
+R179C_strict_Peak_Summary<- chipSeekFunc(peakInfo = R179C_strict_unique)
+dim(R179C_strict_Peak_Summary)
+```
+
+## GO Enrichment Analysis
+
+R179C unique peak GO enrichment analysis
+```{r}
+GOPathFunc(annotated_df = R179C_Peak_Summary, 
+           pvalueCutoff = 0.05, 
+           method = "BP", 
+           DB = org.Mm.eg.db)
+```
+
+R179C strict unique peak GO enrichment analysis
+```{r}
+GOPathFunc(annotated_df = R179C_strict_Peak_Summary, 
+           pvalueCutoff = 0.05, 
+           method = "BP", 
+           DB = org.Mm.eg.db)
+```
+
+Since we can't really see the pattern between chip seq and bulk RNA seq, we will focus on keeping promoter gene for the analysis and see how it preformed in the differential expression result in bulk RNA
+
+R179C 
+```{r}
+R179C_Promoter_Summary<- R179C_Peak_Summary %>% filter(grepl("Promoter", annotation))
+dim(R179C_Promoter_Summary)
+head(R179C_Promoter_Summary$SYMBOL, 10)
+
+R179C_Strict_Promoter_Summary<- R179C_strict_Peak_Summary %>% filter(grepl("Promoter", annotation))
+dim(R179C_Strict_Promoter_Summary)
+head(R179C_Strict_Promoter_Summary$SYMBOL, 10)
+```
+
+## bulk RNA DEG match 
+
+#### R179C evaluation 
+first we need to check if the result we found in chip seq match the differential expression results from bulk RNA seq
+```{r}
+# Load the bulk RNA-seq DEGs
+R179CBulk <- read.csv("./sig_R179C_vs_WT.csv" , header = TRUE)
+colnames(R179CBulk)[1] <- "Gene"
+colnames(R179CBulk)
+```
+
+check if the promoter gene match with DEG results 
+```{r}
+intersect_R179C <- intersect(R179C_Promoter_Summary$SYMBOL, R179CBulk$Gene)
+intersect_R179C
+
+R179CBulk[R179CBulk$Gene %in% intersect_R179C, ]
+# since R179C label 2 as promotor with arguement -5kb - 1kb write csv to export those information as well
+write.csv(R179CBulk[R179CBulk$Gene %in% intersect_R179C, ], "./R179C_Bulk_Promoter_5kb_1kb.csv", row.names = FALSE)
+```
+
+```{r}
+# 1. Load the library
+# install.packages("DT")
+library(DT)
+
+# 2. Prepare the small comparison data
+# This pulls Prune2 and Dnah8 and rounds the values for the viewer
+table_dt <- R179CBulk[R179CBulk$Gene %in% c("Prune2", "Dnah8"), ]
+table_dt$baseMean <- round(table_dt$baseMean, 2)
+table_dt$log2FoldChange <- round(table_dt$log2FoldChange, 2)
+table_dt$padj <- formatC(table_dt$padj, format = "e", digits = 2)
+
+# 3. Show in RStudio Viewer
+datatable(table_dt, 
+          caption = 'Candidate Gene Comparison: R179C vs WT',
+          options = list(dom = 't', ordering = FALSE), # 't' shows just the table (no search/filter)
+          rownames = FALSE) %>%
+  formatStyle('Gene', 
+              target = 'row', 
+              backgroundColor = styleEqual('Prune2', '#ffcccc')) # Highlights Prune2 row
+```
+
+
+check how the bulkRNA result with +- 50 kb  
+```{r}
+# Define the columns you want to keep
+PeakListInfo <- c("seqnames", "start", "end", "width", "annotation", "distanceToTSS", "SYMBOL")
+
+# Filter rows for the 37 genes AND filter for the columns in PeakListInfo
+R179C_Filtered_Summary <- R179C_Peak_Summary[R179C_Peak_Summary$SYMBOL %in% intersect_R179C, PeakListInfo]
+
+R179C_Filtered_Summary[abs(R179C_Filtered_Summary$distanceToTSS) < 50000, ]
+R179CBulk[R179CBulk$Gene %in% R179C_Filtered_Summary[abs(R179C_Filtered_Summary$distanceToTSS) < 50000, "SYMBOL"], ]
+```
+
+## summarized necessary file
+
+57 gene selection 
+```{r}
+unique(R179C_Promoter_Summary$SYMBOL)
+length(unique(R179C_Promoter_Summary$SYMBOL))
+write.csv(R179C_Promoter_Summary, "./R179C_Promoter_5kb_1kb_peak_Summary.csv", row.names = FALSE)
+```
+## Check if the study focused gene match with the peak found in R179C
+
+```{r}
+FocusGene<- c("Acta2", "Cnn1", "Tagln", "Myh11", "Tspan2", "Itga8", "Smtn",
+              "Dhx32os", "Myocd", "Mrtfa", "Lmod1")
+R179C_Peak_Summary[R179C_Peak_Summary$SYMBOL %in% FocusGene, ]
+```
+
+#### Gopeak result (slide 25 step 10 pval 0.05)
+the whole data is under the directory goPeakRes_Step25_slide10 --pval 0.05 
+```{r}
+histL = c("R179C", "tgfB", "wildType") 
+repL = paste0("Rep", 1:3)
+peakSummary = data.frame()
+
+for(hist in histL){
+  # Temporary list to store GRanges for this condition
+  temp_rep_list <- list()
+  
+  # Step 1: Read all available replicates first
+  for(rep in repL){
+    pattern_string <- paste0(hist, "_", rep, ".*_peaks")
+    
+    target_file <- list.files(
+      path = "../cutTagRes/cutAndTag/goPeakRes_Step25_slide10/",
+      pattern = pattern_string,
+      full.names = TRUE)
+    
+    target_file <- target_file[!grepl("Identifier", target_file)]
+    
+    if(length(target_file) > 0){
+      peakInfo = read.table(target_file[1], header = FALSE)
+      message("Successfully read: ", basename(target_file[1]))
+      
+      peak_gr = GRanges(seqnames = peakInfo$V1,
+                        ranges = IRanges(start = peakInfo$V2, end = peakInfo$V3))
+      
+      # Store the GRanges in our list named by the Replicate
+      temp_rep_list[[rep]] <- peak_gr
+    } else {
+      warning("Could not find file for ", hist, " ", rep)
+    }
+  }
+  
+  # Step 2: Calculate the Common Peak set (Intersection of all found replicates)
+  if(length(temp_rep_list) >= 2){
+    # Start with the first replicate
+    common_gr = temp_rep_list[[1]]
+    
+    # Intersect with every subsequent replicate found
+    for(i in 2:length(temp_rep_list)){
+      hits = findOverlaps(common_gr, temp_rep_list[[i]])
+      common_gr = common_gr[unique(queryHits(hits))]
+    }
+    
+    # This is your final consensus count (e.g., 604)
+    final_consensus_count = length(common_gr)
+    
+    # Step 3: Create rows for the table using the final consensus count
+    for(rep_name in names(temp_rep_list)){
+      temp_row = data.frame(
+        Histone = hist,
+        Replicate = rep_name,
+        peakN = length(temp_rep_list[[rep_name]]), # Total in this file (e.g., 1973)
+        peakReprodNum = final_consensus_count      # Always the common count (e.g., 604)
+      )
+      peakSummary = rbind(peakSummary, temp_row)
+    }
+    
+    # Optional: Save the consensus BED file for your Heatmap
+    # rtracklayer::export(common_gr, paste0(hist, "_consensus_peaks.bed"))
+    
+  } else {
+    message("Not enough replicates to calculate overlap for ", hist)
+  }
+}
+
+# Step 4: Final Calculation
+peakReprod = peakSummary %>% 
+  mutate(peakReprodRate = (peakReprodNum / peakN) * 100)
+
+print(peakReprod)
+```
+
+```{r}
+library(DT)
+library(dplyr)
+peakReprodSub<- subset(peakReprod, Histone %in% c("R179C", "wildType"))
+# 1. Pre-process: No string conversion needed since these are already integers/doubles
+# We use peakReprodRate directly for the heatmap effect
+plot_peak_data <- peakReprodSub 
+
+# 2. Create the polished Peak Reproduction table
+datatable(plot_peak_data, 
+          rownames = FALSE,
+          # Rename headers to be professional for the poster
+          colnames = c("Condition", "Replicate", "Total Peaks", "Reproduced Peaks", "Reproduction %"),
+          options = list(
+              dom = 't',                         # Clean layout: table only
+              pageLength = 6,                    # Show all rows
+              columnDefs = list(
+                  list(className = 'dt-center', targets = "_all")
+              )
+          )) %>%
+    # Format peak counts with commas
+    formatCurrency(c('peakN', 'peakReprodNum'), 
+                   currency = "", interval = 3, mark = ",", digits = 0) %>%
+    # Format the Rate to 2 decimal places
+    formatRound('peakReprodRate', 2) %>%
+    # Apply a Green Heatmap to Reproduction Rate (Higher = More Consistent)
+    formatStyle(
+        'peakReprodRate',
+        backgroundColor = styleInterval(c(30, 50), c('#F7FCF0', '#E0F3DB', '#A8DDB5')),
+        fontWeight = 'bold'
+    )
+```
+
+
+## master peak (general 3 replicate sample )
+the purpose is to get the master peak list for the heatmap, which is the union of all peaks across all samples. This will allow us to have a comprehensive set of peaks to analyze and visualize in the heatmap, ensuring that we capture all relevant regions of interest from our ChIP-seq data.
+```{r}
+mPeak = GRanges()
+## overlap with bam file to get count 
+for(hist in histL){
+  for(rep in repL){
+    pattern_string <- paste0(hist, "_", rep, ".*_peaks")
+    
+    target_file <- list.files(
+      path = "../cutTagRes/cutAndTag/goPeakRes_Step25_slide10/",
+      pattern = pattern_string,
+      full.names = TRUE)
+    
+    target_file <- target_file[!grepl("Identifier", target_file)]
+    
+    if(length(target_file) > 0){
+      peakInfo = read.table(target_file[1], header = FALSE)
+      message("Successfully read: ", basename(target_file[1]))
+      
+      mPeak = GRanges(seqnames = peakInfo$V1,
+                        ranges = IRanges(start = peakInfo$V2, end = peakInfo$V3), strand = "*") %>% append (mPeak, .)
+    } else {
+      warning("Could not find file for ", hist, " ", rep)
+    }
+    
+    
+  }
+}
+
+masterPeak = reduce(mPeak)
+```
+
+## Get the fragment counts for each peak in the master peak list 
+
+```{r}
+#library(DESeq2)
+
+# Initialize the matrix
+countMat = matrix(NA, length(masterPeak),
+                  length(histL) * length(repL))
+
+# Get the fragment counts for each peak in the master peak list.
+i = 1
+for(hist in histL){
+  for(rep in repL){
+    
+    # 1. Create a pattern that looks for BOTH the condition and the replicate
+    # Example: "R179C_Rep1" followed by anything, ending in our BAM suffix
+    file_pattern <- paste0(hist, "_", rep, ".*_bowtie2\\.mapped\\.noEcoli\\.bam$")
+    
+    # 2. Search for the file in your directory
+    target_file <- list.files(path = "../alignment/bamWOEcoli/noEcoli/", pattern = file_pattern, full.names = TRUE)
+    
+    # 3. Safety check: Make sure we found exactly one file
+    if(length(target_file) > 0){
+      message("Successfully matched: ", basename(target_file[1]))
+      
+      # Use the matched filename for getCounts
+      fragment_counts <- getCounts(target_file[1], masterPeak, paired = TRUE, by_rg = FALSE, format = "bam")
+      countMat[, i] = counts(fragment_counts)[,1]
+      
+    } else {
+      warning("ERROR: Could not find a file matching pattern: ", file_pattern)
+    }
+    
+    i = i + 1
+  }
+}
+
+colnames(countMat) = paste(rep(histL, each = 3), rep(repL, 3),
+                           sep = "_")
+```
+
+run the code below is any of the code below run into undefine function issue
+
+```{r}
+peak_ids <- paste(seqnames(masterPeak), start(masterPeak), end(masterPeak), sep="_")
+rownames(countMat) <- peak_ids
+```
+
+## Sequencing depth normalization and differential enriched peaks detection 
+
+```{r}
+
+selectR = which(rowSums((countMat> 0)) >= 5) # remove low count genes 
+dataS = countMat[selectR,]
+
+condition <- factor(rep(histL, each = length(repL)))
+
+dds<- DESeqDataSetFromMatrix(countData = dataS,
+                              colData = DataFrame(condition),
+                              design = ~ condition)
+DDS<- DESeq(dds)
+normDDS<- counts(DDS, normalized=TRUE) ## normalization with respect to the sequencing depth 
+colnames(normDDS) = paste0(colnames(normDDS), "_norm")
+res = results(DDS, independentFiltering = FALSE,
+              altHypothesis = "greaterAbs")
+countMatDiff = cbind(dataS, normDDS, res)
+#head(countMatDiff)
+```
+
+## compare differntial enriched peaks between different conditions 
+
+```{r}
+res_R179C<- results(DDS, contrast = c("condition", "R179C", "wildType"), independentFiltering = FALSE, altHypothesis = "greaterAbs")
+```
+
+take the significant peaks with log2FoldChange > 1 and padj < 0.05 for each comparison 
+```{r}
+sig_R179C <- res_R179C[which(res_R179C$padj < 0.05 & res_R179C$log2FoldChange > 1), ]
+```
+
+combining raw count, normalized count and the result of differential enriched peaks detection for each comparison with R179C mutate based
+```{r}
+countMatDiff_R179C = cbind(dataS, normDDS, res_R179C)
+
+coords<- as.data.frame(masterPeak[selectR])
+results_table_R179C<- cbind(coords[, c("seqnames", "start",
+                                 "end")],
+                      countMatDiff_R179C)
+repressive_candidate_R179C<- results_table_R179C[which(results_table_R179C$padj < 0.05 & results_table_R179C$log2FoldChange > 1), ]
+rownames(repressive_candidate_R179C)
+```
+
+from the result we got from repressive_candidate_R179C the only peak shown as significant is the peak located at: 
+chr17: 11327880: 11329215
+## Match unique/2 out of 3 unique peak 
+
+## Peak Filter (R179C)
+R179C unique peak match with the result table, the function will extract the peak information and the count information for the unique peak in R179C condition amount 3 replicate, the unique peak is defined as those peak that select amount one type of replicate only, like 3 replicate
+```{r}
+R179C_unique<- extract_target_peak(res_table = results_table_R179C, 
+                             bed_path = "../cutTagRes/cutAndTag/goPeakRes_Step25_slide10/unique_R179C.bed", 
+                             master_gr = masterPeak, 
+                             select_index = selectR)
+```
+
+R179 Strict Unique peak match with the result table, the function will extract the peak information and the count information for the strict unique peak in R179C condition amount 3 replicate, the strict unique peak is defined as those peak that select amount one type of replicate only, like 3 replicate and also not found in other condition 
+```{r}
+R179C_2out3<- extract_target_peak(res_table = results_table_R179C, 
+                             bed_path = "../cutTagRes/cutAndTag/goPeakRes_Step25_slide10/R179C_2out3.bed",
+                             master_gr = masterPeak, 
+                             select_index = selectR)
+```
+
+## inverse Match Execution 
+```{r}
+#BiocManager::install(c("ChIPseeker", 
+#                       "TxDb.Mmusculus.UCSC.mm10.knownGene", 
+#                       "org.Mm.eg.db",
+#                       "clusterProfiler"))
+library(ChIPseeker)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+library(org.Mm.eg.db)
+```
+
+R179C unique peak summary and annotation
+```{r}
+R179C_Peak_Summary<- chipSeekFunc(peakInfo = R179C_unique)
+dim(R179C_Peak_Summary)
+R179C_2out3_Peak_Summary<- chipSeekFunc(peakInfo = R179C_2out3)
+dim(R179C_2out3_Peak_Summary )
+```
+
+## promotor check -5kb to +1kb
+
+#### R179C unique peak/2out3 promotor check 
+```{r}
+R179C_Promoter_Summary<- R179C_Peak_Summary %>% filter(grepl("Promoter", annotation))
+dim(R179C_Promoter_Summary)
+head(R179C_Promoter_Summary$SYMBOL, 10)
+
+R179C_2out3_Promoter_Summary<- R179C_2out3_Peak_Summary %>% filter(grepl("Promoter", annotation))
+dim(R179C_2out3_Promoter_Summary)
+head(R179C_2out3_Promoter_Summary$SYMBOL, 10)
+```
+
+## bulk RNA DEG match 
+
+#### R179C evaluation (-5kb to +1kb)
+first we need to check if the result we found in chip seq match the differential expression results from bulk RNA seq
+```{r}
+# Load the bulk RNA-seq DEGs
+R179CBulk <- read.csv("./sig_R179C_vs_WT.csv" , header = TRUE)
+colnames(R179CBulk)[1] <- "Gene"
+colnames(R179CBulk)
+```
+check if the promoter gene match with DEG results (R179C unique)
+```{r}
+intersect_R179C <- intersect(R179C_Promoter_Summary$SYMBOL, R179CBulk$Gene)
+intersect_R179C
+
+R179CBulk[R179CBulk$Gene %in% intersect_R179C, ]
+```
+
+```{r}
+library(DT)
+
+# Create the first table
+prune2_tab <- R179CBulk[R179CBulk$Gene %in% intersect_R179C, ]
+
+datatable(prune2_tab, 
+          caption = 'Table 1: Target Gene Validation (Prune2)',
+          options = list(dom = 't'), 
+          rownames = FALSE) %>%
+  formatRound(columns=c('baseMean', 'log2FoldChange'), digits=2) %>%
+  formatSignif(columns=c('pvalue', 'padj'), digits=3) %>%
+  # Highlight Prune2 row
+  formatStyle('Gene', target = 'row', 
+              backgroundColor = styleEqual('Prune2', '#ffcccc'))
+```
+
+
+check if the promoter gene match with DEG results (R179C 2out3)
+```{r}
+intersect_R179C_2out3 <- intersect(R179C_2out3_Promoter_Summary$SYMBOL, R179CBulk$Gene)
+intersect_R179C_2out3
+
+R179CBulk[R179CBulk$Gene %in% intersect_R179C_2out3, ]
+```
+
+```{r}
+# Create the intersection table
+intersect_tab <- R179CBulk[R179CBulk$Gene %in% intersect_R179C_2out3, ]
+
+datatable(intersect_tab, 
+          caption = 'Table 2: Genes Matching Promoter Results (2/3 Replicates)',
+          options = list(pageLength = 10, dom = 'tip'), 
+          rownames = FALSE) %>%
+  formatRound(columns=c('baseMean', 'log2FoldChange'), digits=2) %>%
+  formatSignif(columns=c('pvalue', 'padj'), digits=3) %>%
+  # Highlight Prune2 row within the larger list
+  formatStyle('Gene', target = 'row', 
+              backgroundColor = styleEqual('Prune2', '#ffcccc'))
+```
+
