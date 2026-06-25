@@ -1,0 +1,150 @@
+---
+title: "PeakModifed"
+author: "Yu Kuan Pan"
+date: "2026-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(chromVAR)
+library(GenomicRanges)
+library(dplyr)
+library(DESeq2)
+library(clusterProfiler) # run pathway analysis 
+library(org.Mm.eg.db) # for mus musculus gene annotation
+library(TxDb.Mmusculus.UCSC.mm10.knownGene) # for mus musculus gene annotation
+```
+
+```{r}
+txdb<- TxDb.Mmusculus.UCSC.mm10.knownGene
+all_genes<- genes(txdb)
+
+gene_centers<- start(all_genes) + (width(all_genes)/2)
+windoow_start<- pmax(1, gene_centers - 50000) # gene starter from either the first part of the chromosome or 50kb before the gene center
+window_end<- gene_centers + 50000 # gene end at 50kb after the gene center
+
+gene_windows<- GRanges(seqnames(all_genes), IRanges(windoow_start, window_end), strand = "*",
+                       gene_id = names(all_genes))
+# extract the entrez ids for all genes
+entrez_ids<- mcols(all_genes)$gene_id
+
+# Quert the database for matching official gene Symbols
+gene_symbols<- mapIds(org.Mm.eg.db, keys = entrez_ids,
+                      column = "SYMBOL",
+                      keytype = "ENTREZID", multiVals = "first")
+
+ # Overwrite the number inside gene_windows with the corresponding gene symbols
+mcols(gene_windows)$gene_symbols<- 
+  ifelse(is.na(gene_symbols), entrez_ids, gene_symbols)
+
+
+```
+
+```{r} 
+# ==============================================================================
+# 1. Initialize File Paths and Input Data 
+# ==============================================================================
+# make sure to change the path to the loacl directory that store the clean.bed this location is only for the devleopment path 
+bed_files <- c(
+  "R179C_1" = "../../../alignment/bedU/KWA-62279_S36_L001_bowtie2.clean.bed.gz",
+  "R179C_2" = "../../../alignment/bedU/KWA-62282_S39_L001_bowtie2.clean.bed.gz",
+  "R179C_3" = "../../../alignment/bedU/KWA-62285_S42_L001_bowtie2.clean.bed.gz",
+  "WT_1"    = "../../../alignment/bedU/KWA-62277_S34_L001_bowtie2.clean.bed.gz",
+  "WT_2"    = "../../../alignment/bedU/KWA-62280_S37_L001_bowtie2.clean.bed.gz",
+  "WT_3"    = "../../../alignment/bedU/KWA-62283_S40_L001_bowtie2.clean.bed.gz"
+)
+
+total_reads_per_sample <- numeric(length(bed_files))
+names(total_reads_per_sample) = names(bed_files)
+
+counts_matrix <- matrix(0, nrow = length(gene_windows), ncol = length(bed_files))
+colnames(counts_matrix) <- names(bed_files)
+
+# ==============================================================================
+# 2. Loop Through BED Files and Calculate Overlaps
+# ==============================================================================
+for(i in seq_along(bed_files)) {
+  message("Counting reads for: ", names(bed_files)[i])
+  bed_data <- read.table(bed_files[i], header = FALSE)
+  
+  total_reads_per_sample[i] <- nrow(bed_data)
+  
+  reads_gr <- GRanges(seqnames = bed_data$V1, ranges = IRanges(start = bed_data$V2, end = bed_data$V3))
+  counts_matrix[, i] <- countOverlaps(gene_windows, reads_gr)
+}
+
+combined_data <- data.frame(gene_id = mcols(gene_windows)$gene_id, counts_matrix)
+
+# Calculate Group Mean of RAW counts
+combined_data$R179C_raw_mean <- rowMeans(combined_data[, c("R179C_1", "R179C_2", "R179C_3")])
+combined_data$WT_raw_mean    <- rowMeans(combined_data[, c("WT_1", "WT_2", "WT_3")])
+
+# Perform CPM Normalization
+cpm_matrix <- matrix(0, nrow = nrow(counts_matrix), ncol = ncol(counts_matrix))
+for(i in 1:ncol(counts_matrix)) {
+  cpm_matrix[, i] <- (counts_matrix[, i] / total_reads_per_sample[i]) * 1000000
+}
+colnames(cpm_matrix) <- paste0(colnames(counts_matrix), "_CPM")
+combined_data <- cbind(combined_data, cpm_matrix)
+
+# Calculate Group Mean of Normalized CPM
+combined_data$R179C_CPM_mean <- rowMeans(combined_data[, c("R179C_1_CPM", "R179C_2_CPM", "R179C_3_CPM")])
+combined_data$WT_CPM_mean    <- rowMeans(combined_data[, c("WT_1_CPM", "WT_2_CPM", "WT_3_CPM")])
+```
+
+```{r}
+# Calculate log2 fold change based on normalized CPM values
+combined_data$log2FC <- log2((combined_data$R179C_CPM_mean + 1) / (combined_data$WT_CPM_mean + 1))
+
+
+raw_cutoff <- 150     
+fc_cutoff  <- 0.585   
+
+combined_data$global_cpm_avg <- rowMeans(cpm_matrix)
+valid_data <- subset(combined_data, global_cpm_avg >= 3)
+
+r179c_unique_ids <- subset(valid_data, R179C_raw_mean >= raw_cutoff & log2FC > fc_cutoff)$gene_id
+
+wt_unique_ids    <- subset(valid_data, WT_raw_mean >= raw_cutoff & log2FC < -fc_cutoff)$gene_id
+
+message("Condition-Specific R179C genes: ", length(r179c_unique_ids))
+message("Condition-Specific WT genes: ", length(wt_unique_ids))
+
+wt_gene_names <- bitr(wt_unique_ids, 
+                      fromType = "ENTREZID", 
+                      toType   = "SYMBOL", 
+                      OrgDb    = org.Mm.eg.db)
+
+r179c_gene_names <- bitr(r179c_unique_ids, 
+                         fromType = "ENTREZID", 
+                         toType   = "SYMBOL", 
+                         OrgDb    = org.Mm.eg.db)
+
+# ==============================================================================
+# 4. Run KEGG Analysis Directly Using Entrez IDs
+# ==============================================================================
+kegg_r179c <- enrichKEGG(gene         = r179c_unique_ids, 
+                         organism     = 'mmu', 
+                         pvalueCutoff = 0.05)
+
+kegg_wt    <- enrichKEGG(gene         = wt_unique_ids, 
+                         organism     = 'mmu', 
+                         pvalueCutoff = 0.05)
+
+# ==============================================================================
+# 5. Generate Visual Dotplots
+# ==============================================================================
+if(!is.null(kegg_r179c) && nrow(kegg_r179c) > 0) {
+  dotplot(kegg_r179c, showCategory=20, title="R179C Specific KEGG Pathways")
+} else {
+  message("Note: No enriched pathways met the significance threshold for R179C specific genes.")
+}
+
+if(!is.null(kegg_wt) && nrow(kegg_wt) > 0) {
+  dotplot(kegg_wt, showCategory=20, title="WT Specific KEGG Pathways")
+} else {
+  message("Note: No enriched pathways met the significance threshold for WT specific genes.")
+}
+```
+
