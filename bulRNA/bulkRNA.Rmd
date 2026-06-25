@@ -1,0 +1,1762 @@
+---
+title: "BulkRNAv3"
+author: "Yu Kuan Pan"
+date: "2026-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SummarizedExperiment)
+library(tximport)
+library(readr)
+library(GenomicFeatures) # for creating TxDb object
+library(txdbmaker) 
+library(tidyverse) # for data manipulation and visualization
+library(DESeq2) # for differential expression analysis
+library(edgeR) # for differential expression analysis
+library(pheatmap) # for heatmap
+library(readxl) # for reading excel file
+library(clusterProfiler) # pathway analysis package 
+library(org.Mm.eg.db) # mouse annotation package
+#remotes::install_github("YuLab-SMU/ReactomePA", ref = "devel")
+library(ReactomePA)
+```
+
+# install library if not already install 
+un-comment this part if the packages is not installed yet 
+```{r}
+#if(!requireNamespace("BiocManager", quietly = T)){
+#  install.packages("BiocManager")
+#  BiocManager::install(version = "3.20")
+#}
+
+# Use BiocManager to install tximport 
+#BiocManager::install("tximport")
+#BiocManager::install("edgeR")
+
+#BiocManager::install("GenomicFeatures")
+#BiocManager::install("txdbmaker")
+
+#if(!requireNamespace("biomaRt", quietly = T)){
+#  install.packages("biomaRt")
+#}
+
+#BiocManager::install("rtracklayer")
+```
+
+## load in necessary Cell Count information  
+```{r}
+library(data.table)
+
+counts_dir<- "../../bulkRNAData/"
+files <- list.files(
+  counts_dir,
+  pattern = "\\.counts(\\.txt)?$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+files <- files[!grepl("Zone\\.Identifier", files, ignore.case = TRUE)]
+
+
+# filename -> clean sample name
+pretty_name <- function(f) {
+  nm <- sub("\\.counts(\\.txt)?$", "", basename(f))  # drop extension
+  nm <- sub("(_S\\d+.*)$", "", nm)                   # drop _Sxx... suffix
+  nm <- sub("(\\d)percent-(\\d)$", "\\1percent\\2", nm)  # 1percent-3 -> 1percent3
+  nm
+}
+
+# read one file (first two cols only), name second col as sample
+read_one <- function(f) {
+  dt <- fread(
+    f, header = FALSE, data.table = TRUE,
+    select = 1:2,                      # only first 2 columns
+    col.names = c("gene", "count")     # set column names directly
+  )
+  dt[, gene := as.character(gene)]
+  dt[, count := as.integer(count)]
+  # collapse duplicates if any
+  dt <- dt[, .(count = sum(count, na.rm = TRUE)), by = gene]
+  setnames(dt, "count", pretty_name(f))  # rename 2nd col to sample name
+  dt
+}
+
+lst <- lapply(files, read_one)
+
+# merge by gene (union) and fill missing with 0
+merged <- Reduce(function(x, y) merge(x, y, by = "gene", all = TRUE), lst)
+for (j in 2:ncol(merged)) {
+  set(merged, which(is.na(merged[[j]])), j, 0L)
+}
+
+count_matrix <- as.matrix(merged[, -1])
+rownames(count_matrix) <- merged$gene
+storage.mode(count_matrix) <- "integer"
+
+dim(count_matrix)
+colnames(count_matrix)
+```
+
+```{r}
+summary(count_matrix)
+```
+
+```{r}
+dim(count_matrix)
+```
+
+```{r}
+hist(count_matrix, main= "Gene Expression", xlab = "Counts")
+```
+
+## Identify Marker gene with Differential Expression 
+```{r}
+sample_info<- data.frame(
+  sampleName = c("R179C-1percent-1_S21",
+                 "R179C-1percent-2_S24",
+                 "R179C-1percent-3_S27",
+                 "WT-1percent-1_S19",
+                 "WT-1percent-2_S22",
+                 "WT-1percent-3_S25",
+                 "WT-TGFb-1percent-1_S20",
+                 "WT-TGFb-1percent-2_S23",
+                 "WT-TGFb-1percent-3_S26"),
+  condition = c("R179C", "R179C", "R179C",
+                "WT", "WT", "WT",
+                "TGFb", "TGFb", "TGFb"),
+  replicate = c("1", "2", "3",
+                "1", "2", "3",
+                "1", "2", "3")
+  
+)
+rownames(sample_info)<- sample_info$sampleName
+```
+
+## Data Cleaning and Preprocessing
+the following chuck is designed to filter out those 
+```{r}
+dge_all<- DGEList(counts = count_matrix)
+design_filter <- model.matrix(~condition, data= sample_info)
+keep<- filterByExpr(dge_all, design = design_filter, min.cont = 10)
+filtered_count_matrix<- count_matrix[keep, ]
+```
+
+```{r}
+summary(filtered_count_matrix)
+```
+
+```{r}
+dim(filtered_count_matrix)
+```
+
+```{r}
+hist(filtered_count_matrix, main= "Gene Expression", xlab = "Counts")
+```
+
+```{r}
+count_matrix<- filtered_count_matrix
+```
+
+## Exchange gene id with actual gene name 
+this chunk will be checked later since some of the gene aren't able to matched with the ID use control shift c to comment all chunk
+```{r}
+
+stopifnot(all(count_matrix == round(count_matrix)))
+counts<- as.matrix(count_matrix)
+
+# strip version suffix from Ensembl IDs
+ens <- sub("\\.\\d+$", "", rownames(counts))
+
+mapfile<- "../../mm10_ens2symbol.tsv"
+
+map<- read.delim(mapfile, header = F, sep = "\t",
+                 col.names =
+                   c("ensembl_gene_id", "gene_name"),
+                 stringsAsFactors = F)
+
+# check for both gene ID match ens
+matched_ids <- intersect(ens, map$ensembl_gene_id)
+length(matched_ids)
+head(matched_ids, 10)
+
+# Remove ".5" or ".16" etc.
+ens_ids <- sub("\\.\\d+$", "", rownames(count_matrix))
+rownames(count_matrix) <- ens_ids
+
+# make sure column names in map are: ensembl_gene_id, gene_name
+colnames(map) <- c("ensembl_gene_id", "gene_name")
+
+# remove duplicated Ensembl IDs in the map
+map <- map[!duplicated(map$ensembl_gene_id), ]
+
+# create a vector for quick lookup
+gene_names <- setNames(map$gene_name, map$ensembl_gene_id)
+
+# replace Ensembl IDs by matched gene name
+matched_genes <- gene_names[rownames(count_matrix)]
+
+# any NA means not found → keep Ensembl ID
+matched_genes[is.na(matched_genes)] <- rownames(count_matrix)[is.na(matched_genes)]
+
+# assign new names
+rownames(count_matrix) <- matched_genes
+colnames(count_matrix)<- rownames(sample_info)
+```
+
+## creating DESeq object for Differential Expression
+```{r}
+colnames(count_matrix)<- rownames(sample_info)
+dds<- DESeqDataSetFromMatrix(countData = count_matrix,
+                             colData = sample_info,
+                             design = ~ condition)
+
+dds$condition <- relevel(dds$condition, ref = "WT")
+
+dds<- DESeq(dds)
+
+```
+
+```{r}
+# pairwise
+res_R179C_vs_WT   <- results(dds, contrast = c("condition","R179C","WT"))
+res_TGFb_vs_WT    <- results(dds, contrast = c("condition","TGFb","WT"))
+```
+
+```{r}
+# global “compare all together” (ANOVA-like)
+dds_lrt <- DESeq(dds, test="LRT", reduced=~1)
+res_LRT <- results(dds_lrt)   # genes that vary across WT/R179C/TGFb
+```
+
+## PCA and sample distance heatmap
+```{r}
+set.seed(123)
+# subset to only R179C and WT samples for clearer visualization
+samples_to_keep<- sample_info$condition %in% c("R179C", "WT")
+dds_subset <- dds[, samples_to_keep]
+dds_subset$condition <- factor(dds_subset$condition, levels = c("WT", "R179C"))  # drop unused levels
+vsd_subset<- vst(dds_subset, blind = FALSE)
+dds<- dds_subset
+vsd<- vsd_subset
+mat<- assay(vsd_subset)
+#vsd <- vst(dds, blind = FALSE)
+#mat <- assay(vsd)
+
+# PCA with sample labels
+library(ggplot2)
+library(ggrepel) # Highly recommended for PCA labels
+
+p <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(p, "percentVar"))
+
+ggplot(p, aes(PC1, PC2, color = condition, label = name)) +
+  geom_point(size = 3) +
+  # geom_text_repel handles the "off-screen" and overlapping labels automatically
+  geom_text_repel(size = 3, box.padding = 0.5, max.overlaps = Inf) +
+  # Expand the X-axis limits manually to ensure the long text strings fit
+  expand_limits(x = c(min(p$PC1) - 5, max(p$PC1) + 10)) + 
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  ggtitle("PCA (vst) — all samples") +
+  theme_bw() # Professional look for posters
+
+
+# Sample distance heatmap
+d <- dist(t(assay(vsd)))
+pheatmap(as.matrix(d), annotation_col=as.data.frame(colData(dds)[,"condition",drop=FALSE]))
+```
+
+```{r}
+library(ggrepel)
+# 1. Create the clean labels (WT-1, WT-2, WT-3, R179C-1...)
+# This creates a sequence (1, 2, 3) for each 'condition' group
+replicate_numbers <- ave(seq_along(dds_subset$condition), 
+                         dds_subset$condition, 
+                         FUN = seq_along)
+
+# 2. Combine the Condition with the Number
+# Result: "WT-1", "WT-2", "WT-3", "R179C-1", "R179C-2", "R179C-3"
+new_names <- paste0(dds_subset$condition, "-", replicate_numbers)
+
+# 3. Apply to the dds object
+colnames(dds_subset) <- new_names
+
+# 4. Proceed to VST and PCA
+vsd_subset <- vst(dds_subset, blind = FALSE)
+p <- plotPCA(vsd_subset, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(p, "percentVar"))
+
+# 5. PCA Plot with Clean labels
+ggplot(p, aes(PC1, PC2, color = condition, label = name)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 4, box.padding = 0.5, fontface = "bold") +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  theme_bw(base_size = 14) +
+  ggtitle("PCA: R179C vs WT ")
+
+# 6. Sample Distance Heatmap
+d <- dist(t(assay(vsd_subset)))
+pheatmap(as.matrix(d), 
+         clustering_distance_rows = d,
+         clustering_distance_cols = d,
+         annotation_col = as.data.frame(colData(dds_subset)[,"condition",drop=FALSE]),
+         main = "Sample Distance Heatmap")
+```
+
+
+### R179C vs wildType 
+```{r}
+sig_R179C_vs_WT<- subset(res_R179C_vs_WT, padj < 0.05
+                         & abs(log2FoldChange) > 1)
+sig_R179C_vs_WT<- as.data.frame(sig_R179C_vs_WT[order(sig_R179C_vs_WT$log2FoldChange, decreasing = T),])
+nrow(sig_R179C_vs_WT)
+head(sig_R179C_vs_WT, 10)
+```
+
+remove the argument for log2FC > 1
+```{r}
+sig_pval_R179C_vs_WT<- subset(res_R179C_vs_WT, padj < 0.05)
+sig_pval_R179C_vs_WT<- as.data.frame(sig_pval_R179C_vs_WT[order(sig_pval_R179C_vs_WT$log2FoldChange, decreasing = T),])
+nrow(sig_pval_R179C_vs_WT)
+#write.csv(sig_pval_R179C_vs_WT, "./bulkRNA3repRes/sig_pval_R179C_vs_WT.csv")
+```
+### validate gene list result with previous study WT vs R179C
+library tidyverse include the read_excel from readxl library 
+the chunk below is to validate the DEG result that we receive from WT vs R179C, in the previous study we found 
+```{r}
+sheets<- excel_sheets("../../bulkRNARefence1Replicate/DEGs.xlsx")
+print(sheets)
+R179C_WT_ref<- read_excel(
+  "../../bulkRNARefence1Replicate/DEGs.xlsx",
+           sheet = "1vs2") %>% 
+  select(geneName, log2FC, Probability)
+nrow(R179C_WT_ref)
+head(R179C_WT_ref, 10)
+```
+
+#### check common gene 
+```{r}
+InterGene<- intersect(rownames(sig_R179C_vs_WT), R179C_WT_ref$geneName )
+nrow(sig_R179C_vs_WT[InterGene,])
+head(sig_R179C_vs_WT[InterGene,],10)
+```
+
+```{r}
+write.csv(as.data.frame(sig_R179C_vs_WT), "./sig_R179C_vs_WT.csv")
+```
+
+
+```{r}
+save(sig_R179C_vs_WT, file = "./sig_R179C_vs_WT.RData")
+```
+
+## Create MA & volcano plot 
+
+#### R179C  vs WT
+```{r}
+DESeq2::plotMA(res_R179C_vs_WT, main = "R179C vs WT", ylim = c(-5,5),
+       alpa=0.05)
+```
+
+### Volcano plot R179C vs WT
+```{r}
+#devtools::install_github('kevinblighe/EnhancedVolcano')
+library(EnhancedVolcano)
+
+EnhancedVolcano(res_R179C_vs_WT,
+                lab = rownames(res_R179C_vs_WT),
+                x = 'log2FoldChange',
+                y = 'padj',
+                title = 'R179C vs WT',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                pointSize = 2.0,
+                labSize = 3.0)
+```
+
+```{r}
+# 1. set res_R179C vs WT as data frame for easier manipulation
+res_df <- as.data.frame(res_R179C_vs_WT)
+res_robust <- res_df[which(res_df$baseMean > 600 & !is.na(res_df$padj)), ]
+
+# 2. Identify Top 40 for each condition (R179C up and WT up/R179C down)
+# Sorting by Log2FC for magnitude
+top10_R179C <- head(rownames(res_robust[order(res_robust$log2FoldChange, decreasing = TRUE), ]), 10)
+top10_WT    <- head(rownames(res_robust[order(res_robust$log2FoldChange, decreasing = FALSE), ]), 10)
+
+# 3. Combine them and explicitly add Prune2
+# unique() prevents errors if Prune2 is already in the top 40
+genes_to_label <- unique(c("Prune2",top10_R179C, top10_WT))
+
+# 4. Generate the Volcano Plot
+library(EnhancedVolcano)
+EnhancedVolcano(res_R179C_vs_WT,
+                lab = rownames(res_R179C_vs_WT),
+                selectLab = genes_to_label, # This is the key line
+                x = 'log2FoldChange',
+                y = 'padj',
+                title = 'R179C vs WT baseMean > 600',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                pointSize = 2.0,
+                labSize = 7.0,
+                drawConnectors = TRUE,   # Adds lines from label to point
+                widthConnectors = 0.5,
+                colConnectors = 'black')
+```
+
+```{r}
+# 1. Identify the Top 40 robust genes per side
+res_df <- as.data.frame(res_R179C_vs_WT)
+res_robust <- res_df[which(res_df$baseMean > 600 & !is.na(res_df$padj)), ]
+
+top40_up <- head(rownames(res_robust[order(res_robust$log2FoldChange, decreasing = TRUE), ]), 40)
+top40_down <- head(rownames(res_robust[order(res_robust$log2FoldChange, decreasing = FALSE), ]), 40)
+
+# 2. label list 
+my_labels <- unique(c(top40_up, top40_down))
+
+# 3. Generate the Volcano Plot (Standard Colors)
+library(EnhancedVolcano)
+EnhancedVolcano(res_df,
+                lab = rownames(res_df),
+                x = 'log2FoldChange',
+                y = 'padj',
+                selectLab = my_labels,
+                title = 'R179C vs WT Transcriptional Profile',
+                subtitle = 'Top 40 Robust DEGs (baseMean > 600)',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                # Standard Colors: NS=grey, Log2FC=green, p-value=blue, both=red
+                col = c('grey', 'forestgreen', 'royalblue', 'red2'),
+                pointSize = 2.0,
+                labSize = 3.5,
+                # Ensure all 81 names are visible
+                max.overlaps = Inf, 
+                drawConnectors = TRUE,
+                widthConnectors = 0.5,
+                colConnectors = 'black',
+                legendPosition = 'right',
+                gridlines.major = FALSE,
+                gridlines.minor = FALSE)
+```
+#### Volcano plot (baseMean > 600)
+```{r}
+# 1. Setup - We only want ONE label
+res_df <- as.data.frame(res_R179C_vs_WT)
+my_label <- "Prune2"
+
+# 2. Plotting (Minimalist for the Poster)
+library(EnhancedVolcano)
+EnhancedVolcano(res_df,
+                lab = rownames(res_df),
+                x = 'log2FoldChange',
+                y = 'padj',
+                selectLab = my_label,        # ONLY Prune2 will be labeled
+                title = 'R179C vs WT: Transcriptional Validation',
+                subtitle = 'Validated Target: Prune2 ',
+                pCutoff = 0.05,
+                FCcutoff = 1.0,
+                # Using your standard colors
+                col = c('grey', 'forestgreen', 'royalblue', 'red2'),
+                pointSize = 2.0,
+                labSize = 6.0,               # Made the label larger since it is the only one
+                # --- CLEAN CONNECTOR ---
+                drawConnectors = TRUE,
+                widthConnectors = 0.6,
+                colConnectors = 'black',
+                arrowheads = FALSE,          # Just the straight line you wanted
+                lengthConnectors = unit(0.1, "npc"), 
+                # -----------------------
+                max.overlaps = Inf,
+                gridlines.major = FALSE,
+                gridlines.minor = FALSE,
+                legendPosition = 'right')    
+```
+
+## plot count example 
+use Prune2 gene as example
+```{r}
+plotCounts(dds, gene="Prune2", intgroup="condition")
+```
+
+## Heatmap of top 20 DEGs
+
+#### R179C vs WT
+```{r}
+top20_R179C_vs_WT <- head(rownames(sig_R179C_vs_WT), 20)
+mat_R179C_vs_WT <- assay(vst(dds))[top20_R179C_vs_WT, ]
+mat_R179C_vs_WT <- mat_R179C_vs_WT - rowMeans(mat_R179C_vs_WT)
+pheatmap(mat_R179C_vs_WT, annotation_col = as.data.frame(colData(dds)[, "condition", drop=F]))
+```
+
+```{r}
+# R179C upregulated genes
+#r179c_up <- subset(res_R179C_vs_WT, log2FoldChange > 1 & padj < 0.05)
+#top20_R179C <- head(rownames(r179c_up[order(r179c_up$padj), ]), 20)
+top20_R179C <- head(rownames(sig_R179C_vs_WT), 20)
+
+# WT upregulated genes
+#wt_up <- subset(res_R179C_vs_WT, log2FoldChange < -1  & padj < 0.05)
+#top20_WT <- head(rownames(wt_up[order(wt_up$padj), ]), 20)
+
+# Already filtered for padj < 0.05 and |log2FC| > 1
+sig_R179C_vs_WT_WT <- sig_R179C_vs_WT[order(sig_R179C_vs_WT$log2FoldChange), ]
+top20_WT <- head(rownames(sig_R179C_vs_WT_WT), 20)
+
+# Combine gene set
+combined_genes <- c(top20_R179C, top20_WT)
+
+# Subset samples to R179C and WT only 
+selected_samples <- colData(dds)$condition %in% c("R179C", "WT")
+
+mat_combined <- assay(vst(dds))[combined_genes, selected_samples]
+mat_combined <- mat_combined - rowMeans(mat_combined)
+
+annotation <- as.data.frame(colData(dds)[selected_samples, "condition", drop=FALSE])
+
+pheatmap(mat_combined,
+         annotation_col = annotation,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE, 
+         main = "Heatmap of Top 20 DE Genes: R179C vs WT")
+
+```
+
+```{r}
+# 1. Filter for Robustness (baseMean > 600)
+# Assuming sig_R179C_vs_WT is your dataframe of significant results
+sig_robust <- sig_R179C_vs_WT[sig_R179C_vs_WT$baseMean > 600, ]
+
+# 2. Extract Top 40 R179C Enriched (Highest Log2FC)
+# We sort by log2FoldChange decreasing to get the most upregulated
+top40_R179C <- head(rownames(sig_robust[order(sig_robust$log2FoldChange, decreasing = TRUE), ]), 40)
+
+# 3. Extract Top 40 WT Enriched (Lowest Log2FC / Most Repressed)
+# We sort by log2FoldChange increasing to get the most downregulated
+top40_WT <- head(rownames(sig_robust[order(sig_robust$log2FoldChange, decreasing = FALSE), ]), 40)
+
+# 4. Combine and Ensure Prune2 is included
+# Since Prune2 is around rank 40, we add it explicitly to be safe
+combined_genes <- unique(c(top40_R179C, top40_WT))
+
+# 5. Subset samples correctly (Ensure 3 replicates only)
+# We filter for condition AND ensure we only take replicates 1, 2, and 3
+selected_samples <- colData(dds)$condition %in% c("R179C", "WT") & 
+                    colData(dds)$replicate %in% c("1", "2", "3")
+
+# 6. Prepare Matrix (Using VST values)
+# We use the subset of samples we just defined
+vst_mat <- assay(vst(dds))
+mat_combined <- vst_mat[combined_genes, selected_samples]
+
+# Row-center the data (Z-score style) to highlight differences
+mat_combined <- mat_combined - rowMeans(mat_combined)
+
+# 7. Create Heatmap
+annotation <- as.data.frame(colData(dds)[selected_samples, "condition", drop=FALSE])
+
+pheatmap(mat_combined,
+         annotation_col = annotation,
+         cluster_rows = FALSE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE, 
+         fontsize_row = 6, # Smaller font since we have 80+ genes
+         main = "Heatmap: Top 40 Robust DE Genes (baseMean > 600)")
+
+
+```
+
+```{r}
+# Load required libraries
+library(pheatmap)
+library(grid)
+
+# 1. Filter for Robustness (baseMean > 600)
+sig_robust <- sig_R179C_vs_WT[sig_R179C_vs_WT$baseMean > 600, ]
+
+# 2. Extract Top 40 R179C Enriched (Highest Log2FC)
+top40_R179C <- head(rownames(sig_robust[order(sig_robust$log2FoldChange, decreasing = TRUE), ]), 40)
+
+# 3. Extract Top 40 WT Enriched (Lowest Log2FC)
+top40_WT <- head(rownames(sig_robust[order(sig_robust$log2FoldChange, decreasing = FALSE), ]), 40)
+
+# 4. Combine and Ensure Prune2 is included
+# Using unique() prevents duplicates if Prune2 is already in the top 40
+combined_genes <- unique(c(top40_R179C, top40_WT))
+
+# 5. Subset samples (R179C and WT, Replicates 1-3)
+selected_samples <- colData(dds)$condition %in% c("R179C", "WT") & 
+                    colData(dds)$replicate %in% c("1", "2", "3")
+
+# 6. Prepare Matrix (Using VST values)
+vst_mat <- assay(vst(dds))
+mat_combined <- vst_mat[combined_genes, selected_samples]
+
+# --- IMPROVED SCALING ---
+# Instead of just centering, we use Z-scores so all genes have equal visual weight
+mat_scaled <- t(scale(t(mat_combined)))
+
+# 7. Create Annotation Dataframe
+annotation <- as.data.frame(colData(dds)[selected_samples, "condition", drop=FALSE])
+
+# 8. Generate the Heatmap Object (Store it in 'p' instead of drawing immediately)
+p <- pheatmap(mat_scaled,
+              annotation_col = annotation,
+              cluster_rows = FALSE,   # Keep your Top 40 / Bottom 40 order
+              cluster_cols = TRUE,    # Cluster samples to see groups
+              show_rownames = TRUE, 
+              fontsize_row = 5,       # Slightly larger for readability
+              main = "Heatmap: Top 40 Robust DE Genes (BaseMean > 600)")
+
+# 9. INJECT CUSTOM COLORS FOR PRUNE2
+# Find which grob (graphical object) contains the row names
+cols <- rep("black", nrow(mat_scaled))
+# Find the exact position of Prune2 in the matrix rows
+prune2_idx <- which(rownames(mat_scaled) == "Prune2")
+
+# If Prune2 exists in your list, color it red and make it bold
+if(length(prune2_idx) > 0){
+  cols[prune2_idx] <- "red"
+  
+  # Get the row names grob
+  row_names_grob <- p$gtable$grobs[[which(p$gtable$layout$name == "row_names")]]
+  
+  # Apply the color vector and bold face
+  row_names_grob$gp$col <- cols
+  row_names_grob$gp$fontface <- ifelse(cols == "red", "bold", "plain")
+  
+  # Put the modified grob back into the plot object
+  p$gtable$grobs[[which(p$gtable$layout$name == "row_names")]] <- row_names_grob
+}
+
+# 10. Draw the final Result
+grid.newpage()
+grid.draw(p$gtable)
+```
+
+
+## pathway analysis function
+```{r}
+suppressMessages({
+  library(clusterProfiler)
+  library(ReactomePA)
+  library(org.Mm.eg.db)
+  library(ggplot2)
+  library(openxlsx)
+})
+
+Pathway_Enrich <- function(sig_gene_list,
+                           condition = "Sample",
+                           method = c("KEGG", "Reactome"),
+                           p_cut = 0.05,
+                           showCategory = 10,
+                           output_prefix = "Pathway") {
+  
+  method <- match.arg(method)  # restrict to KEGG or Reactome
+  
+  message(paste0("Running ", method, " enrichment for ", condition, " ..."))
+  
+  # ---- Convert gene symbols to Entrez IDs
+  gene_symbols <- rownames(sig_gene_list)
+  entrez_ids <- suppressMessages(
+    bitr(gene_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+  )
+  
+  if (is.null(entrez_ids) || nrow(entrez_ids) == 0) {
+    warning("No valid Entrez IDs found for enrichment.")
+    return(NULL)
+  }
+  
+  # ---- Run enrichment analysis
+  enrich_res <- switch(
+    method,
+    KEGG = suppressMessages(
+      enrichKEGG(gene = entrez_ids$ENTREZID,
+                 organism = "mmu",
+                 pvalueCutoff = p_cut)
+    ),
+    Reactome = suppressMessages(
+      enrichPathway(gene = entrez_ids$ENTREZID,
+                    organism = "mouse",
+                    pvalueCutoff = p_cut)
+    )
+  )
+  
+  if (is.null(enrich_res) || nrow(as.data.frame(enrich_res)) == 0) {
+    message("No significant enrichment found.")
+    return(NULL)
+  }
+  
+  # ---- Plot results
+  print(
+    dotplot(enrich_res, showCategory = showCategory) +
+      ggtitle(paste(method, "Pathway Enrichment -", condition))
+  )
+  
+  # ---- Convert to readable format (add gene symbols)
+  readable_res <- suppressMessages(
+    setReadable(enrich_res, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+  )
+  
+  result_df <- as.data.frame(readable_res)
+  
+  # ---- Save output to Excel
+  output_file <- paste0(output_prefix, "_", condition, "_", method, "_pathway.xlsx")
+  openxlsx::write.xlsx(result_df, output_file, overwrite = TRUE)
+  message(paste("Saved:", output_file))
+  
+  return(result_df)
+}
+```
+
+```{r}
+# Run KEGG for R179C
+R179C_KEGG<- Pathway_Enrich(sig_R179C_vs_WT, condition = "R179C", method = "KEGG")
+R179C_KEGG
+
+# Run Reactome for R179C
+R179C_Reactome<- Pathway_Enrich(sig_R179C_vs_WT, condition = "R179C", method = "Reactome")
+R179C_Reactome
+
+
+```
+
+
+
+## Pathway analysis 
+```{r}
+## R179C vs WT Pathway Analysis
+library(clusterProfiler)
+library(org.Mm.eg.db)
+#library(enrichplot)
+
+# Convert gene symbols to Entrez IDs
+gene_symbols <- rownames(sig_R179C_vs_WT)
+entrez_ids <- bitr(gene_symbols, fromType = "SYMBOL",
+                   toType = "ENTREZID",
+                   OrgDb = org.Mm.eg.db)
+
+## KEGG Pathway Analysis
+if(!is.null(entrez_ids) && nrow(entrez_ids) > 0){
+  kegg_enrich <- enrichKEGG(gene = entrez_ids$ENTREZID,
+                            organism = 'mmu',
+                            pvalueCutoff = 0.05)
+  if(!is.null(kegg_enrich) && nrow(as.data.frame(kegg_enrich)) > 0){
+    # Visualize KEGG results
+    print(dotplot(kegg_enrich,
+                  showCategory=10) +
+            ggtitle("KEGG Pathway Enrichment"))
+    # Convert KEGG pathway IDs to readable gene symbol 
+    kegg_genes <- setReadable(kegg_enrich,
+                                    OrgDb = org.Mm.eg.db,
+                                    keyType = "ENTREZID")
+    print(as.data.frame(kegg_genes))
+    
+  } else {
+    print("No significant KEGG pathways found.")
+  }
+} else {
+  print("No valid Entrez IDs found for KEGG analysis.")
+}
+```
+
+return gene list that classified under each go term with all three category, Biological_Process, Molecular_Function, Cellular_Component
+```{r}
+library(openxlsx)
+library(dplyr)
+library(clusterProfiler)
+
+export_top_GO_terms <- function(GO_result_list,
+                                condition_name,
+                                top_n = NULL,       # If NULL, export all dotplot-visible terms
+                                output_prefix = "GO_Results",
+                                remove_empty = TRUE # Option B: filter out terms without geneID
+                                ) {
+  
+  ontologies <- c("Biological_Process", "Molecular_Function", "Cellular_Component")
+  
+  for (ont in ontologies) {
+    
+    if (!ont %in% names(GO_result_list)) {
+      message(paste("Skipping", ont, "- not found in provided list."))
+      next
+    }
+    
+    go_obj <- GO_result_list[[ont]]$result
+    go_expanded <- GO_result_list[[ont]]$expanded
+    
+    if (is.null(go_obj) || is.null(go_expanded)) {
+      message(paste("Skipping", ont, "- missing data."))
+      next
+    }
+    
+    # convert enrichResult object to data frame
+    go_df <- as.data.frame(go_obj)
+    
+    # ---- If top_n not specified, use same terms as dotplot (default = 10 or fewer)
+    if (is.null(top_n)) {
+      # Extract top categories shown in dotplot (based on p.adjust & gene ratio)
+      top_terms <- go_df %>%
+        arrange(p.adjust, desc(GeneRatio)) %>%
+        slice_head(n = 10)
+    } else {
+      top_terms <- go_df %>%
+        arrange(p.adjust) %>%
+        slice_head(n = top_n)
+    }
+    
+    filtered_expanded <- go_expanded %>%
+      filter(ID %in% top_terms$ID)
+    
+    # ---- Option B: Remove terms with empty or NA geneID
+    if (remove_empty) {
+      filtered_expanded <- filtered_expanded %>%
+        filter(!is.na(geneID), geneID != "")
+    }
+    
+    # ---- Create Excel workbook
+    wb <- createWorkbook()
+    
+    for (go_id in unique(filtered_expanded$ID)) {
+      sub_df <- filtered_expanded %>% filter(ID == go_id)
+      term_name <- unique(sub_df$Description)[1]
+      
+      # Clean & shorten Excel sheet name
+      safe_name <- paste0(
+        gsub("[^A-Za-z0-9]", "_", go_id), "_",
+        gsub("[^A-Za-z0-9]", "_", substr(term_name, 1, 15))
+      )
+      safe_name <- substr(safe_name, 1, 31)
+      
+      addWorksheet(wb, safe_name)
+      writeData(wb, safe_name, sub_df)
+    }
+    
+    # ---- Save workbook per ontology
+    filename <- paste0(output_prefix, "_", condition_name, "_", ont, "_filtered.xlsx")
+    saveWorkbook(wb, filename, overwrite = TRUE)
+    
+    message(paste("saved:", filename))
+  }
+}
+
+```
+
+#### Add additional replicate to the data (4th replicate)
+```{r}
+library(dplyr)
+library(purrr)
+
+# 1. Define folder path - ensure this matches your folder name exactly
+data_dir <- "../../bulkRNARefence1Replicate/Counts/"
+
+# 2. Identify the count files
+# Updated pattern to be more flexible (looks for 'counts' anywhere in the name)
+count_files <- list.files(path = data_dir, 
+                          pattern = "counts", 
+                          full.names = TRUE)
+
+# Filter out the 'Identifier' files manually to be safe
+count_files <- count_files[!grepl("Identifier", count_files)]
+
+# --- SAFETY CHECK ---
+if (length(count_files) == 0) {
+  stop("No files found! Check if './Count' is the correct folder and contains the .txt files.")
+}
+
+# 3. Read and Merge
+counts_combined <- count_files %>%
+  map(function(file) {
+    # Using read.table; check if your files use tabs or commas
+    df <- read.table(file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+    
+    # Standardize the first column name for joining
+    colnames(df)[1] <- "GeneID"
+    
+    # Extract a clean sample name from the file path
+    sample_id <- basename(file) %>% gsub("_counts.*", "", .)
+    colnames(df)[2] <- sample_id
+    
+    return(df)
+  }) %>%
+  reduce(full_join, by = "GeneID")
+
+# 4. Final Formatting
+rownames(counts_combined) <- counts_combined$GeneID
+counts_combined <- as.matrix(counts_combined[,-1])
+
+# View result
+print(paste("Successfully merged", ncol(counts_combined), "files."))
+#head(counts_combined)
+```
+
+## Identify Marker gene with Differential Expression 
+```{r}
+ sample_info_4rep<- data.frame(
+  sampleName = c("R179C-1percent-1",
+                 "R179C-1percent-2",
+                 "R179C-1percent-3",
+                 "R179C-1percent-4",
+                 "WT-1percent-1",
+                 "WT-1percent-2",
+                 "WT-1percent-3",
+                 "WT-1percent-4",
+                 "WT-TGFb-1percent-1",
+                 "WT-TGFb-1percent-2",
+                 "WT-TGFb-1percent-3",
+                 "WT-TGFb-1percent-4"),
+  batch = c("Batch1","Batch1","Batch1","Batch2", 
+                       "Batch1","Batch1","Batch1","Batch2",
+                       "Batch1","Batch1","Batch1","Batch2"),
+  condition = c("R179C", "R179C", "R179C", "R179C",
+                "WT", "WT", "WT", "WT",
+                "TGFb", "TGFb", "TGFb", "TGFb"),
+  replicate = c("1", "2", "3", "4",
+                "1", "2", "3", "4",
+                "1", "2", "3", "4")
+  
+)
+rownames(sample_info_4rep)<- sample_info_4rep$sampleName
+```
+
+## Replace Ensembl ID with gene symbol for the new replicate data
+```{r}
+# 1. Prepare counts_combined (Ensembl to Symbol Mapping)
+# ---------------------------------------------------
+# Strip version suffix (e.g., .15) from Ensembl IDs in the new replicate data
+ens_ids <- sub("\\.\\d+$", "", rownames(counts_combined))
+rownames(counts_combined) <- ens_ids
+
+# Load your mapping file (ensure path is correct relative to your .Rmd)
+mapfile <- "../../mm10_ens2symbol.tsv"
+map <- read.delim(mapfile, header = FALSE, sep = "\t",
+                  col.names = c("ensembl_gene_id", "gene_name"),
+                  stringsAsFactors = FALSE)
+
+# Remove duplicates in the map file to prevent 1-to-many expansion
+map <- map[!duplicated(map$ensembl_gene_id), ]
+
+# Create a lookup vector for quick translation
+gene_lookup <- setNames(map$gene_name, map$ensembl_gene_id)
+
+# Perform the mapping
+matched_symbols <- gene_lookup[rownames(counts_combined)]
+
+# If no symbol found in the TSV, keep the original Ensembl ID to avoid losing data
+matched_symbols[is.na(matched_symbols)] <- rownames(counts_combined)[is.na(matched_symbols)]
+
+# CRITICAL: Handle duplicate gene symbols (e.g., Symbol.1, Symbol.2)
+# This prevents the "duplicate 'row.names' are not allowed" error in R matrices
+rownames(counts_combined) <- make.unique(as.character(matched_symbols))
+```
+
+
+## Consistant rowname (gene id)
+since there are only 5 common gene appear 
+check the id by strip where everything after the dot would be remove 
+this process won't actually affect the gene name 
+
+```{r}
+# Strip the version (anything after the first dot) from rownames
+strip_ver <- function(x) sub("\\..*$", "", x)
+
+ids_a <- strip_ver(rownames(count_matrix))
+ids_b <- strip_ver(rownames(counts_combined))
+
+length(intersect(ids_a, ids_b))
+
+
+```
+the intersection show that the common gene increase from 41 to 51756 
+the next step is to apply it to the rownames of both datasets
+```{r}
+# Standardize rownames to versionless before merging
+rownames(count_matrix)   <- ids_a
+rownames(counts_combined) <- ids_b
+colnames(counts_combined)<- c("R179C-1percent4", "WT-1percent4", "WT-TGFb-4")
+
+```
+
+
+```{r}
+count_matrix_ordered <- merge(count_matrix, counts_combined, by = "row.names", all.x = TRUE)
+
+# Clean up Row Names
+rownames(count_matrix_ordered) <- count_matrix_ordered$Row.names
+count_matrix_ordered$Row.names <- NULL
+
+# Handle Missing Data (NAs)
+# If a gene was in your original set but not the new one, we fill with 0
+# This prevents DESeq2 from crashing due to missing values
+count_matrix_ordered[is.na(count_matrix_ordered)] <- 0
+
+# Final Formatting
+count_matrix_ordered <- round(as.matrix(count_matrix_ordered))
+
+
+desired_order <- c(
+  "R179C-1percent-1_S21", "R179C-1percent-2_S24", "R179C-1percent-3_S27", "R179C-1percent4", # R179C Group
+  "WT-1percent-1_S19", "WT-1percent-2_S22", "WT-1percent-3_S25", "WT-1percent4",             # WT Group
+  "WT-TGFb-1percent-1_S20", "WT-TGFb-1percent-2_S23", "WT-TGFb-1percent-3_S26", "WT-TGFb-4" # TGFb Group
+)
+
+# 2. Reorder the Matrix columns
+count_matrix_ordered <- count_matrix_ordered[, desired_order]
+```
+
+
+```{r}
+dim(count_matrix_ordered)
+```
+
+```{r}
+summary(count_matrix_ordered)
+```
+
+
+```{r}
+hist(count_matrix_ordered, main= "Gene Expression", xlab = "Counts")
+```
+ 
+```{r}
+colnames(count_matrix_ordered)<- rownames(sample_info_4rep)
+dds_4rep<- DESeqDataSetFromMatrix(countData = count_matrix_ordered,
+                             colData = sample_info_4rep,
+                             design = ~ batch + condition)
+
+dds_4rep$condition <- relevel(dds_4rep$condition, ref = "WT")
+
+dds_4rep<- DESeq(dds_4rep)
+```
+
+creating pairwise analysis so we can compare the gene expression change between R179C vs WT and TGFb vs WT
+```{r}
+# pairwise
+res_R179C_vs_WT_4rep   <- results(dds_4rep, contrast = c("condition","R179C","WT"))
+```
+
+## PCA and sample distance heatmap
+```{r}
+set.seed(123)
+
+vsd_4rep <- vst(dds_4rep, blind = FALSE)
+mat_4rep <- assay(vsd_4rep)
+
+# This keeps all 8 replicates (4 vs 4) but ignores TGFb
+vsd_4rep <- vsd_4rep[, vsd_4rep$condition %in% c("R179C", "WT")]
+# Drop unused factor levels so the legend is clean
+vsd_4rep$condition <- droplevels(vsd_4rep$condition)
+
+
+# PCA with sample labels
+library(ggplot2)
+library(ggrepel) # You will need this for the labels
+
+p <- plotPCA(vsd_4rep, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(p, "percentVar"))
+
+ggplot(p, aes(PC1, PC2, color = condition, label = name)) +
+  geom_point(size = 3) + 
+  # Use ggrepel to prevent overlapping
+  geom_text_repel(
+    size = 3, 
+    show.legend = FALSE,
+    box.padding = 0.5,      # Add space around the text
+    point.padding = 0.3,    # Add space between text and point
+    max.overlaps = Inf      # Ensure all labels are shown
+  ) +
+  # Expand limits to give the labels room to breathe
+  expand_limits(x = c(min(p$PC1) - 10, max(p$PC1) + 15)) +
+  # Prevents labels from being cut off at the edge of the plot
+  coord_cartesian(clip = "off") +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  ggtitle("PCA (vst) — all samples (4 Replicates)") +
+  theme_bw() # Clean white background for better visibility
+
+# Sample distance heatmap
+d <- dist(t(assay(vsd_4rep)))
+pheatmap(as.matrix(d), annotation_col=as.data.frame(colData(dds_4rep)[,"condition",drop=FALSE]))
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+
+# 1. Generate clean, sequential replicate numbers (1 to 4)
+# This looks at the 'condition' and counts 1,2,3,4 for each group automatically
+replicate_numbers <- ave(seq_along(vsd_4rep$condition), 
+                         vsd_4rep$condition, 
+                         FUN = seq_along)
+
+# 2. Create the clean strings
+new_names <- paste0(vsd_4rep$condition, "-", replicate_numbers)
+
+# 3. Apply the new names to the object
+colnames(vsd_4rep) <- new_names
+
+# 4. Update PCA Data
+p <- plotPCA(vsd_4rep, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(p, "percentVar"))
+
+# PCA Plot with Clean Labels
+ggplot(p, aes(PC1, PC2, color = condition, label = name)) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    size = 4, 
+    show.legend = FALSE,
+    box.padding = 0.5, 
+    point.padding = 0.3,
+    fontface = "bold"
+  ) +
+  expand_limits(x = c(min(p$PC1) - 5, max(p$PC1) + 5)) +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  ggtitle("PCA: 4 Replicates per Condition (Cleaned)") +
+  theme_bw(base_size = 14)
+
+# 5. Update Sample Distance Heatmap
+d <- dist(t(assay(vsd_4rep)))
+pheatmap(as.matrix(d), 
+         clustering_distance_rows = d,
+         clustering_distance_cols = d,
+         annotation_col = as.data.frame(colData(vsd_4rep)[,"condition",drop=FALSE]),
+         main = "Sample Distance Heatmap (4 Replicates)",
+         fontsize = 10)
+```
+
+
+## Check replicate 
+since the fourth replicate is from another dataset 
+the following chunk is designed to check if the batch effect got handle correctly 
+```{r}
+plotPCA(vsd_4rep, intgroup=c("condition","batch"))
+
+```
+
+```{r}
+sample_info_clean_4rep<- sample_info_4rep %>% filter(condition %in% c("R179C", "WT"))
+```
+
+
+since the batch effect still exist check 
+```{r}
+library(limma)
+expr_corrected <- removeBatchEffect(assay(vsd_4rep), batch=sample_info_clean_4rep$batch)
+
+# PCA on corrected data
+pca_corrected <- prcomp(t(expr_corrected))
+plot(pca_corrected$x[,1:2], col=as.factor(sample_info_clean_4rep$condition), pch=19)
+```
+
+```{r}
+# 1. Install/Load ggrepel if you haven't already
+# install.packages("ggrepel")
+library(ggplot2)
+library(ggrepel)
+
+# 2. Run PCA on corrected expression matrix
+pca <- prcomp(t(expr_corrected)) 
+pca_df <- as.data.frame(pca$x[, 1:2]) 
+pca_df$sample <- rownames(pca_df)
+pca_df$condition <- sample_info_clean_4rep$condition[match(pca_df$sample, sample_info_clean_4rep$sampleName)]
+
+# 3. Calculate Variance Explained for Axis Labels
+percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)))
+
+# 4. Plot with "Smart" Labels
+ggplot(pca_df, aes(x=PC1, y=PC2, color=condition, label=sample)) +
+  geom_point(size=4) + # Made points slightly larger for the poster
+  # geom_text_repel is the fix for missing/merged labels
+  geom_text_repel(
+    size = 3.5,
+    force = 2,            # Increases the "push" between overlapping labels
+    box.padding = 0.5,    # Space around the text
+    point.padding = 0.5,  # Space between point and text
+    min.segment.length = 0, # Always draw a line from label to point if moved
+    max.overlaps = Inf    # Forces all labels to show, even if crowded
+  ) +
+  # Expand the plot window so labels on the far edge aren't cut off
+  scale_x_continuous(expand = expansion(mult = c(0.15, 0.2))) + 
+  theme_bw() + # BW theme is cleaner for posters than minimal
+  labs(
+    title="PCA after Batch Correction (R179C vs WT)", 
+    x=paste0("PC1: ", percentVar[1], "% variance"), 
+    y=paste0("PC2: ", percentVar[2], "% variance")
+  )
+```
+
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# 1. Run PCA on corrected expression matrix
+pca <- prcomp(t(expr_corrected)) 
+pca_df <- as.data.frame(pca$x[, 1:2]) 
+pca_df$sample <- rownames(pca_df)
+
+# 2. MATCH AND CLEAN THE NAMES
+# Get the condition from your metadata
+pca_df$condition <- sample_info_clean_4rep$condition[match(pca_df$sample, sample_info_clean_4rep$sampleName)]
+
+# Create the clean WT-1, R179C-1 labels
+# This counts 1,2,3,4 based on the order they appear in the condition column
+pca_df <- pca_df %>%
+  group_by(condition) %>%
+  mutate(clean_label = paste0(condition, "-", row_number())) %>%
+  ungroup()
+
+# 3. Calculate Variance
+percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)))
+
+# 4. Plot with Clean Labels
+ggplot(pca_df, aes(x=PC1, y=PC2, color=condition, label=clean_label)) +
+  geom_point(size=4) + 
+  geom_text_repel(
+    size = 4,
+    force = 3,            # Increased force to push labels further for clarity
+    box.padding = 0.6,    
+    point.padding = 0.5,  
+    fontface = "bold",    # Bold looks better on large posters
+    min.segment.length = 0, 
+    max.overlaps = Inf    
+  ) +
+  scale_color_manual(values = c("WT" = "#F8766D", "R179C" = "#00BFC4")) +
+  # Expand limits so the labels "WT-4" or "R179C-4" don't hit the edge
+  scale_x_continuous(expand = expansion(mult = c(0.2, 0.2))) + 
+  theme_bw(base_size = 14) + 
+  labs(
+    title="PCA: Batch Corrected R179C vs WT", 
+    x=paste0("PC1: ", percentVar[1], "% variance"), 
+    y=paste0("PC2: ", percentVar[2], "% variance")
+  )
+```
+
+
+## Heatmap of top variable genes after batch correction
+```{r}
+topVarGenes <- head(order(rowVars(expr_corrected), decreasing=TRUE), 500)
+
+annotation <- data.frame(
+  condition = sample_info_clean_4rep$condition,
+  batch = sample_info_clean_4rep$batch
+)
+rownames(annotation) <- sample_info_clean_4rep$sampleName
+
+pheatmap(expr_corrected[topVarGenes, ],
+         annotation_col = annotation,
+         show_rownames = FALSE,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         scale = "row")
+
+```
+
+```{r}
+# 1. Define the specific flipped colors to match your PCA
+# WT = Salmon (#F8766D) | R179C = Teal (#00BFC4)
+# We leave 'batch' alone so it uses the default colors
+ann_colors <- list(
+  condition = c(WT = "#F8766D", R179C = "#00BFC4")
+)
+
+# 2. Ensure the annotation has all 8 samples
+# Make sure sample_info_clean_4rep has 8 rows!
+annotation <- data.frame(
+  condition = sample_info_clean_4rep$condition,
+  batch = as.factor(sample_info_clean_4rep$batch) # Factor ensures discrete colors
+)
+rownames(annotation) <- sample_info_clean_4rep$sampleName
+
+# 3. Select Top 500 Genes
+topVarGenes <- head(order(rowVars(expr_corrected), decreasing=TRUE), 500)
+
+# 4. Generate Heatmap
+library(pheatmap)
+pheatmap(expr_corrected[topVarGenes, ],
+         annotation_col = annotation,
+         annotation_colors = ann_colors,   # <--- FLIPS THE GENOTYPE COLORS
+         show_rownames = FALSE,
+         show_colnames = FALSE,             
+         cluster_rows = FALSE,             # Removes y-axis correlation as requested
+         cluster_cols = TRUE,              # Keeps sample clustering
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         scale = "row")
+```
+```{r}
+# 1. Clean the Sample Names (Remove "1-percent-")
+# This creates clean "WT-1", "WT-2"... names for the x-axis
+replicate_numbers <- ave(seq_along(sample_info_clean_4rep$condition), 
+                         sample_info_clean_4rep$condition, 
+                         FUN = seq_along)
+clean_names <- paste0(sample_info_clean_4rep$condition, "-", replicate_numbers)
+
+# 2. Update Dataframe and Matrix Names
+annotation <- data.frame(
+  condition = sample_info_clean_4rep$condition,
+  batch = as.character(sample_info_clean_4rep$batch) # Character matches the list names below
+)
+rownames(annotation) <- clean_names
+
+# Make a copy of the matrix to avoid changing your original data
+plot_mat <- expr_corrected
+colnames(plot_mat) <- clean_names
+
+# 3. Define Consistent & High-Contrast Colors
+# WT (Salmon) and R179C (Teal) to match PCA. Batch 2 is now Charcoal for contrast.
+ann_colors <- list(
+  condition = c(WT = "#F8766D", R179C = "#00BFC4"),
+  batch = c("1" = "#D9D9D9", "2" = "#4D4D4D") 
+)
+
+# 4. Generate the Heatmap
+library(pheatmap)
+pheatmap(plot_mat[topVarGenes, ],
+         annotation_col = annotation,
+         annotation_colors = ann_colors,   # Flipped Genotype + Distinct Batch
+         show_rownames = FALSE,
+         show_colnames = TRUE,             # Now shows "WT-1", "R179C-1" etc.
+         cluster_rows = FALSE,             # No y-axis correlation/dendrogram
+         cluster_cols = TRUE,              # Keep sample clustering at top
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         scale = "row",
+         main = "Batch Corrected Transcriptional Profile (n=8)",
+         color = colorRampPalette(c("royalblue", "white", "firebrick3"))(50),
+         fontsize_col = 10)
+```
+
+
+```{r}
+# 1. Ensure you have the corrected expression from earlier
+library(limma)
+
+# 2. Run Principal Component Analysis (PCA) on the corrected matrix
+pca_corrected <- prcomp(t(expr_corrected))
+
+# 3. Prepare data for ggplot
+pca_df <- as.data.frame(pca_corrected$x)
+pca_df$condition <- vsd_4rep$condition
+pca_df$batch <- vsd_4rep$batch
+
+# Calculate variance percentages for the axes
+percentVar <- round(100 * (pca_corrected$sdev^2 / sum(pca_corrected$sdev^2)))
+
+# 4. Plot the corrected version
+ggplot(pca_df, aes(PC1, PC2, color = condition, shape = batch)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA: Batch Effect Removed (R179C vs WT)") +
+  theme_bw()
+```
+
+
+## Heatmap of top variable genes after batch correction
+```{r}
+topVarGenes <- head(order(rowVars(expr_corrected), decreasing=TRUE), 500)
+
+annotation <- data.frame(
+  condition = sample_info_clean_4rep$condition,
+  batch = sample_info_clean_4rep$batch
+)
+rownames(annotation) <- sample_info_clean_4rep$sampleName
+
+pheatmap(expr_corrected[topVarGenes, ],
+         annotation_col = annotation,
+         show_rownames = FALSE,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         scale = "row")
+
+```
+
+### R179C vs wildType 
+```{r}
+sig_R179C_vs_WT_4rep<- subset(res_R179C_vs_WT_4rep, padj < 0.05
+                         & abs(log2FoldChange) > 1)
+sig_R179C_vs_WT_4rep<- as.data.frame(sig_R179C_vs_WT_4rep[order(sig_R179C_vs_WT_4rep$log2FoldChange, decreasing = T),])
+nrow(sig_R179C_vs_WT_4rep)
+head(sig_R179C_vs_WT_4rep, 10)
+```
+
+```{r}
+write.csv(as.data.frame(sig_R179C_vs_WT_4rep), "./sig_R179C_vs_WT_4rep.csv")
+```
+
+## Create MA & volcano plot 
+mark: previous simply calling plotMA likely calling plotMA from limma, 
+      make sure to load the function from DESeq2 
+#### R179C  vs WT
+```{r}
+DESeq2::plotMA(res_R179C_vs_WT_4rep, main = "R179C vs WT 4 replicate")
+```
+
+```{r}
+library(EnhancedVolcano)
+
+EnhancedVolcano(res_R179C_vs_WT_4rep,
+                lab = rownames(res_R179C_vs_WT_4rep),   # gene labels
+                x = 'log2FoldChange',              # x-axis: fold change
+                y = 'padj',                        # y-axis: adjusted p-value
+                title = 'R179C vs WT',             # plot title
+                pCutoff = 0.05,                    # significance threshold
+                FCcutoff = 1.0,                    # fold change threshold
+                pointSize = 2.0,                   # point size
+                labSize = 3.0)                     # label size
+```
+
+## plot count example 
+use Prune2 gene as example
+```{r}
+# 1. Subset the dds object to the 8 samples (4 vs 4)
+# This removes the TGFb samples from the counts and metadata
+dds_subset_4rep <- dds_4rep[, dds_4rep$condition %in% c("R179C", "WT")]
+
+# 2. Drop the 'WT-TGFb' level so it doesn't appear in your plots
+dds_subset_4rep$condition <- droplevels(dds_subset_4rep$condition)
+
+# 3. CRITICAL: Re-run the DESeq estimation
+# This ensures the size factors (normalization) are based ONLY on these 8 samples
+dds_subset_4rep <- DESeq(dds_subset_4rep)
+
+# 4. Plot individual gene counts (e.g., Prune2)
+plotCounts(dds_subset_4rep, gene = "Prune2", intgroup = "condition", main = "Prune2: R179C vs WT")
+```
+
+## check if the gene list shown in-consistancy in mutant with stable WT expression 
+```{r}
+geneList<- c("Acta2", "Cnn1", "Tagln", "Myh11", "Tspan2", 
+                  "Itga8", "Smtn", "Dhx32os", "Myocd", "Mrtfa", "Lmod1")
+geneList
+#geneList %in% rownames(count_matrix)
+gene_valid<- geneList[geneList %in% rownames(count_matrix)]
+gene_valid
+
+for(i in 1:length(gene_valid)){
+  plotCounts(dds_subset, gene = gene_valid[i], intgroup = "condition", main = paste0(gene_valid[i], ": R179C vs WT"))
+}
+```
+
+#### R179C vs WT separated for upregulated and downregulated genes
+```{r}
+# R179C upregulated genes
+#r179c_up <- subset(res_R179C_vs_WT, log2FoldChange > 1 & padj < 0.05)
+#top20_R179C <- head(rownames(r179c_up[order(r179c_up$padj), ]), 20)
+top20_R179C_4rep <- head(rownames(sig_R179C_vs_WT_4rep), 20)
+
+# WT upregulated genes
+#wt_up <- subset(res_R179C_vs_WT, log2FoldChange < -1  & padj < 0.05)
+#top20_WT <- head(rownames(wt_up[order(wt_up$padj), ]), 20)
+
+# Already filtered for padj < 0.05 and |log2FC| > 1
+sig_R179C_vs_WT_WT_4rep <- sig_R179C_vs_WT_4rep[order(sig_R179C_vs_WT_4rep$log2FoldChange), ]
+top20_WT_4rep <- head(rownames(sig_R179C_vs_WT_WT_4rep), 20)
+
+# Combine gene set
+combined_genes <- c(top20_R179C_4rep, top20_WT_4rep)
+
+# Subset samples to R179C and WT only 
+selected_samples <- colData(dds_4rep)$condition %in% c("R179C", "WT")
+
+mat_combined <- assay(vst(dds_4rep))[combined_genes, selected_samples]
+mat_combined <- mat_combined - rowMeans(mat_combined)
+
+annotation <- as.data.frame(colData(dds_4rep)[selected_samples, "condition", drop=FALSE])
+
+pheatmap(mat_combined,
+         annotation_col = annotation,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE, 
+         main = "Heatmap of Top 20 DE Genes: R179C vs WT")
+```
+
+
+## pathway analysis function
+```{r}
+suppressMessages({
+  library(clusterProfiler)
+  library(ReactomePA)
+  library(org.Mm.eg.db)
+  library(ggplot2)
+  library(openxlsx)
+})
+
+Pathway_Enrich <- function(sig_gene_list,
+                           condition = "Sample",
+                           method = c("KEGG", "Reactome"),
+                           p_cut = 0.05,
+                           showCategory = 10,
+                           output_prefix = "Pathway") {
+  
+  method <- match.arg(method)  # restrict to KEGG or Reactome
+  
+  message(paste0("Running ", method, " enrichment for ", condition, " ..."))
+  
+  # ---- Convert gene symbols to Entrez IDs
+  gene_symbols <- rownames(sig_gene_list)
+  entrez_ids <- suppressMessages(
+    bitr(gene_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+  )
+  
+  if (is.null(entrez_ids) || nrow(entrez_ids) == 0) {
+    warning("No valid Entrez IDs found for enrichment.")
+    return(NULL)
+  }
+  
+  # ---- Run enrichment analysis
+  enrich_res <- switch(
+    method,
+    KEGG = suppressMessages(
+      enrichKEGG(gene = entrez_ids$ENTREZID,
+                 organism = "mmu",
+                 pvalueCutoff = p_cut)
+    ),
+    Reactome = suppressMessages(
+      enrichPathway(gene = entrez_ids$ENTREZID,
+                    organism = "mouse",
+                    pvalueCutoff = p_cut)
+    )
+  )
+  
+  if (is.null(enrich_res) || nrow(as.data.frame(enrich_res)) == 0) {
+    message("No significant enrichment found.")
+    return(NULL)
+  }
+  
+  # ---- Plot results
+  print(
+    dotplot(enrich_res, showCategory = showCategory) +
+      ggtitle(paste(method, "Pathway Enrichment -", condition))
+  )
+  
+  # ---- Convert to readable format (add gene symbols)
+  readable_res <- suppressMessages(
+    setReadable(enrich_res, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+  )
+  
+  result_df <- as.data.frame(readable_res)
+  
+  # ---- Save output to Excel
+  output_file <- paste0(output_prefix, "_", condition, "_", method, "_pathway.xlsx")
+  openxlsx::write.xlsx(result_df, output_file, overwrite = TRUE)
+  message(paste("Saved:", output_file))
+  
+  return(result_df)
+}
+```
+
+```{r}
+# Run KEGG for R179C
+R179C_KEGG_4rep<- Pathway_Enrich(sig_R179C_vs_WT_4rep, condition = "R179C", method = "KEGG")
+R179C_KEGG_4rep
+
+# Run Reactome for R179C
+R179C_Reactome_4rep<- Pathway_Enrich(sig_R179C_vs_WT_4rep, condition = "R179C", method = "Reactome")
+R179C_Reactome_4rep
+
+```
+
+## Pathway analysis for GO Pathway analysis 
+## Function convert enrichment result to readable gene symbols
+```{r}
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+covert_entrez_to_symbols<- function(enrichment_result){
+  if(!is.null(enrichment_result) &&
+     nrow(enrichment_result)> 0){
+    enrichment_df<- as.data.frame(enrichment_result)
+    
+    #Conver Entrez IDs to gene Symbols 
+    enrichment_df$GeneSymvols<-
+      sapply(strsplit(enrichment_df$geneID, "/"), function(entrez_list){
+       mapped_genes<- bitr(entrez_list, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+       paste(mapped_genes$SYMBOL, collapse = ", ")
+      })
+    return(enrichment_df)
+  } else {
+    return(NULL)
+  }
+  
+}
+```
+
+### go term for portable gene list
+Biological Process (BP): This domain encompasses series of molecular events or functions, representing larger biological objectives that are accomplished by the concerted action of multiple molecular activities.
+
+Molecular Function (MF): This domain describes the activities of individual gene products at the molecular level, such as catalyzing chemical reactions or binding specific chemicals or macromolecules.
+
+Cellular Component (CC): This domain refers to the parts of a cell, including subcellular structures, macromolecular complexes, and the extracellular environment where gene products are located.
+```{r}
+GO_Res <- function(sig_gene_list,
+                   p_cut = 0.05,
+                   organism = "mouse") {
+  # --- Step 1: Load OrgDb based on organism
+  if (organism == "mouse") {
+    OrgDb <- org.Mm.eg.db
+  } else if (organism == "human") {
+    OrgDb <- org.Hs.eg.db
+  } else {
+    stop("Unsupported organism. Use 'mouse' or 'human'.")
+  }
+
+  # --- Step 2: Prepare gene IDs
+  gene_symbols <- rownames(sig_gene_list)
+  entrez_ids <- bitr(gene_symbols,
+                     fromType = "SYMBOL",
+                     toType = "ENTREZID",
+                     OrgDb = OrgDb)
+  
+  # Filter valid Entrez IDs only
+  entrez_ids <- entrez_ids[!is.na(entrez_ids$ENTREZID) & entrez_ids$ENTREZID != "", ]
+  
+  if (is.null(sig_gene_list) || nrow(entrez_ids) == 0) {
+    message("No valid gene list or unsupported organism.")
+    return(NULL)
+  }
+  
+  # --- Step 3: Define helper function for enrichment and table generation
+  run_GO <- function(ont) {
+    result <- enrichGO(gene = entrez_ids$ENTREZID,
+                       OrgDb = OrgDb,
+                       ont = ont,
+                       pvalueCutoff = p_cut,
+                       readable = TRUE)
+    if (is.null(result) || nrow(as.data.frame(result)) == 0) {
+      return(list(result = NULL, df = NULL, expanded = NULL))
+    }
+    
+    df <- as.data.frame(result)
+    
+    # Expand geneID column into individual genes
+    expanded <- df %>%
+      dplyr::select(ID, Description, geneID) %>%
+      tidyr::separate_rows(geneID, sep = "/") %>%
+      dplyr::distinct(geneID, .keep_all = TRUE)
+    
+    # Print summary
+    print(dotplot(result) + ggtitle(paste("GO", ont, "Enrichment")))
+    print(df)
+    
+    return(list(result = result, df = df, expanded = expanded))
+  }
+
+  # --- Step 4: Run GO enrichment for BP, MF, CC
+  go_bp <- run_GO("BP")
+  go_mf <- run_GO("MF")
+  go_cc <- run_GO("CC")
+  
+  # --- Step 5: Combine into a nested return list
+  GO_out <- list(
+    Biological_Process = go_bp,
+    Molecular_Function = go_mf,
+    Cellular_Component = go_cc
+  )
+  
+  message("GO analysis completed successfully.")
+  return(GO_out)
+}
+
+```
+
+#### R179C vs WT GO Pathway Analysis with expanded gene list
+```{r}
+GO_R179C_vs_WT_4rep <- suppressMessages(
+   GO_Res(sig_gene_list = sig_R179C_vs_WT_4rep)
+)
+```
+
+
+```{r}
+commPathWayFunc<- function(gene,
+                           method = "KEGG",
+                           go_type = NULL){
+  
+  entrez <- bitr(gene, fromType =  "SYMBOL",
+                 toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+  
+  if(method == "KEGG"){
+    kegg<- enrichKEGG(gene = entrez$ENTREZID,
+               organism = "mmu",
+               pvalueCutoff = 0.05)
+    return(kegg)
+  } else if (method == "Reactome"){
+    reactome<- enrichPathway(gene = entrez$ENTREZID,
+                  organism = "mouse",
+                  pvalueCutoff = 0.05)
+    return(reactome)
+  } else if (method == "GO" & !is.null(go_type)){
+    go<- enrichGO(gene = entrez$ENTREZID,
+             OrgDb = org.Mm.eg.db,
+             ont = go_type,
+             pvalueCutoff = 0.05,
+             readable = TRUE)
+    return(go)
+  }
+  
+}
+```
+
+#### Common gene between R179C 3rep and 4rep
+```{r}
+dim(sig_R179C_vs_WT)
+dim(sig_R179C_vs_WT_4rep)
+common_R179C_genes <- intersect(rownames(sig_R179C_vs_WT), rownames(sig_R179C_vs_WT_4rep))
+unique_3rep<- setdiff(rownames(sig_R179C_vs_WT), rownames(sig_R179C_vs_WT_4rep))
+
+length(unique_3rep)
+unique_4rep<- setdiff(rownames(sig_R179C_vs_WT_4rep), rownames(sig_R179C_vs_WT))
+length(unique_4rep)
+
+length(common_R179C_genes)
+```
+
+```{r}
+sig_R179C_vs_WT_common<- sig_R179C_vs_WT_4rep[common_R179C_genes,]
+```
+
+```{r}
+#install.packages("ggvenn")
+
+library(ggvenn)
+
+ggvenn(
+  list(
+    `3rep` = rownames(sig_R179C_vs_WT),
+    `4rep` = rownames(sig_R179C_vs_WT_4rep)
+  ),
+  fill_color = c("skyblue", "salmon"),
+  stroke_size = 0.5,
+  set_name_size = 5
+)
+```
+
+
+#### compare R179C KEGG results 
+```{r}
+cc_kegg<- function(gene){
+  commPathWayFunc(gene, method = "KEGG")
+}
+
+compareCluster(geneClusters = list(
+  "3rep" = unique_3rep,
+  "4rep" = unique_4rep,
+  "common" = common_R179C_genes
+), fun = cc_kegg) %>%
+  dotplot(showCategory=10) + ggtitle("KEGG Pathway #Comparison: R179C 3rep vs 4rep")
+
+```
+
+
+
